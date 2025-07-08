@@ -77,12 +77,18 @@ Below are the results obtained on the ImageNet dataset using our proposed QwT.
 |                          | RepQ-ViT + QwT | W4/A4 | 75.5     | W6/A6 | 80.7    |
 | Swin-S (83.2)            |  RepQ-ViT      | W4/A4 | 80.2     | W6/A6 | 82.8    |
 |                          | RepQ-ViT + QwT | W4/A4 | 80.4     | W6/A6 | 82.9    |
-| ResNet18 (71.0)          |  Percentile      | W4/A4 |  58.3    | W6/A6 |  70.7   |
-|                          | Percentile + QwT | W4/A4 |  68.9    | W6/A6 |  71.0   |
-| ResNet50 (76.6)          |  Percentile      | W4/A4 | 68.4     | W6/A6 | 76.0    |
-|                          | Percentile + QwT | W4/A4 | 74.5     | W6/A6 | 76.8    |
-| ResNet101 (77.3)         |  Percentile      | W4/A4 | 74.7     | W6/A6 | 77.1    |
-|                          | Percentile + QwT | W4/A4 | 76.4     | W6/A6 | 77.2    |
+| ResNet18 (71.0)          |  Percentile      | W4/A4 | 47.1   | W6/A6 | 70.4    |
+|                          | Percentile + QwT | W4/A4 | 62.3   | W6/A6 | 70.7    |
+| ResNet50 (76.6)          |  Percentile      | W4/A4 | 62.3   | W6/A6 | 76.4    |
+|                          | Percentile + QwT | W4/A4 | 68.5   | W6/A6 | 76.6    |
+| ResNet101 (77.3)         |  Percentile      | W4/A4 | 67.5   | W6/A6 | 76.8    |
+|                          | Percentile + QwT | W4/A4 | 71.1   | W6/A6 | 76.9    |
+| ResNet18 (71.0)          |  Percentile      | W4/A8 |  58.3  | W6/A8 | 70.7   |
+|                          | Percentile + QwT | W4/A8 |  68.9  | W6/A8 | 71.0   |
+| ResNet50 (76.6)          |  Percentile      | W4/A8 | 68.4   | W6/A8 | 76.0    |
+|                          | Percentile + QwT | W4/A8 | 74.5   | W6/A8 | 76.8    |
+| ResNet101 (77.3)         |  Percentile      | W4/A8 | 74.7   | W6/A8 | 77.1    |
+|                          | Percentile + QwT | W4/A8 | 76.4   | W6/A8 | 77.2    |
 
 ## Citation
 

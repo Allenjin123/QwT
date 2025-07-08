@@ -35,7 +35,6 @@ class QuantConv2d(nn.Conv2d):
                                           bias=bias)
 
         input_quant_params_conv = deepcopy(input_quant_params)
-        input_quant_params_conv['n_bits'] = 8
         self.input_quantizer = UniformQuantizer(**input_quant_params_conv)
         self.weight_quantizer = UniformQuantizer(**weight_quant_params)
 
