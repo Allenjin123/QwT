@@ -15,34 +15,43 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
-import copy
+import os
 import random
 import socket
-from contextlib import suppress
+import time
 from functools import partial
+
+import numpy as np
+import pytorch_quantization.nn as quant_nn
+import torch.distributed
+import torch.nn as nn
+import torch.utils.data
+from timm.data.dataset import ImageDataset
+from timm.models import create_model
+from timm.utils import accuracy
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
-import torch.distributed
-import torch.distributed as dist
-import torch.utils.data
-from timm.data import Mixup
-from timm.data.dataset import ImageDataset
-from timm.loss import SoftTargetCrossEntropy
-from timm.utils import random_seed, NativeScaler, accuracy
-from torch.amp import autocast as amp_autocast
-from torch.nn.parallel import DistributedDataParallel as NativeDDP
-from timm.scheduler.scheduler_factory import CosineLRScheduler
-from torch.utils.data import Dataset
+from models import quant_vision_transformer, vision_transformer
 
-from quant import *
-from utils import *
-from utils.utils import write, create_transform, create_loader, AverageMeter, broadcast_tensor_from_main_process, gather_tensor_from_multi_processes, compute_quantized_params
+from utils.utils import write, create_transform, create_loader, AverageMeter, broadcast_tensor_from_main_process, \
+    gather_tensor_from_multi_processes, compute_quantized_params, collect_stats_format, compute_amax_format
 
 HOST_NAME = socket.getfqdn(socket.gethostname())
 
 torch.backends.cudnn.benchmark = True
 LINEAR_COMPENSATION_SAMPLES = 512
 
+def onnx_export(q_model, dummy_input, suffix):
+    quant_nn.TensorQuantizer.use_fb_fake_quant = True
+    torch.onnx.export(
+        q_model,
+        dummy_input,
+        os.path.join(args.log_dir, '{}_bs_{}_{}.onnx'.format(args.model, dummy_input.size(0), suffix)),
+        verbose=False,
+        do_constant_folding=False
+    )
+    quant_nn.TensorQuantizer.use_fb_fake_quant = False
 
 def seed(seed=0):
     random.seed(seed)
@@ -85,13 +94,14 @@ class CompensationBlock(nn.Module):
 
 def enable_quant(submodel):
     for name, module in submodel.named_modules():
-        if isinstance(module, QuantConv2d) or isinstance(module, QuantLinear) or isinstance(module, QuantMatMul):
-            module.set_quant_state(True, True)
+        if isinstance(module, quant_nn.TensorQuantizer):
+            module.enable_quant()
+
 
 def disable_quant(submodel):
     for name, module in submodel.named_modules():
-        if isinstance(module, QuantConv2d) or isinstance(module, QuantLinear) or isinstance(module, QuantMatMul):
-            module.set_quant_state(False, False)
+        if isinstance(module, quant_nn.TensorQuantizer):
+            module.disable_quant()
 
 class FeatureDataset(Dataset):
     def __init__(self, X):
@@ -152,69 +162,63 @@ def generate_compensation_model(q_model, train_loader, args):
     feature_loader = torch.utils.data.DataLoader(feature_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     output_previous = output_t
-    for layer_id in range(len(q_model.layers)):
-        current_layer = q_model.layers[layer_id]
-        for block_id in range(len(current_layer.blocks)):
+    for block_id in range(len(q_model.blocks)):
 
-            feature_set.X = output_previous.detach().cpu()
+        feature_set.X = output_previous.detach().cpu()
 
-            block = current_layer.blocks[block_id]
-            output_full_precision = torch.zeros(size=[0, ], device=args.device)
-            output_quant = torch.zeros(size=[0, ], device=args.device)
-            output_t_ = torch.zeros(size=[0, ], device=args.device)
-            for i, t_out in tqdm(enumerate(feature_loader)):
-                t_out = t_out.cuda()
-                disable_quant(block)
-                full_precision_out = block(t_out)
+        block = q_model.blocks[block_id]
+        output_full_precision = torch.zeros(size=[0, ], device=args.device)
+        output_quant = torch.zeros(size=[0, ], device=args.device)
+        output_t_ = torch.zeros(size=[0, ], device=args.device)
+        for i, t_out in tqdm(enumerate(feature_loader)):
+            t_out = t_out.cuda()
+            disable_quant(block)
+            full_precision_out = block(t_out)
 
-                enable_quant(block)
-                quant_out = block(t_out)
+            enable_quant(block)
+            quant_out = block(t_out)
 
-                output_t_ = torch.cat([output_t_, t_out.detach()], dim=0)
-                output_full_precision = torch.cat([output_full_precision, full_precision_out.detach()], dim=0)
-                output_quant = torch.cat([output_quant, quant_out.detach()], dim=0)
+            output_t_ = torch.cat([output_t_, t_out.detach()], dim=0)
+            output_full_precision = torch.cat([output_full_precision, full_precision_out.detach()], dim=0)
+            output_quant = torch.cat([output_quant, quant_out.detach()], dim=0)
 
-                torch.cuda.synchronize()
-                if i >= (LINEAR_COMPENSATION_SAMPLES // args.batch_size  // args.world_size - 1):
-                    break
+            torch.cuda.synchronize()
+            if i >= (LINEAR_COMPENSATION_SAMPLES // args.batch_size  // args.world_size - 1):
+                break
 
-            assert torch.sum((output_previous - output_t_).abs()) < 1e-3
-            global_block_id = sum(q_model.depths[:layer_id]) + block_id
-            W, b, r2_score = linear_regression(output_t_, output_full_precision - output_quant, block_id=global_block_id)
-            current_layer.blocks[block_id] = CompensationBlock(W=W, b=b, r2_score=r2_score, block=current_layer.blocks[block_id], linear_init=True if global_block_id >= args.start_block else False, local_rank=args.local_rank, block_id=global_block_id)
-            q_model.cuda()
+        assert torch.sum((output_previous - output_t_).abs()) < 1e-3
+        W, b, r2_score = linear_regression(output_t_, output_full_precision - output_quant, block_id=block_id)
+        q_model.blocks[block_id] = CompensationBlock(W=W, b=b, r2_score=r2_score, block=q_model.blocks[block_id], linear_init=True if block_id >= args.start_block else False, local_rank=args.local_rank, block_id=block_id)
+        q_model.cuda()
 
-            qwerty_block = current_layer.blocks[block_id]
+        QwT_block = q_model.blocks[block_id]
 
-            output_previous = torch.zeros(size=[0, ], device=args.device)
-            for i, t_out in tqdm(enumerate(feature_loader)):
-                t_out = t_out.cuda()
-                enable_quant(qwerty_block)
-                previous_out = qwerty_block(t_out)
+        output_previous = torch.zeros(size=[0, ], device=args.device)
+        for i, t_out in tqdm(enumerate(feature_loader)):
+            t_out = t_out.cuda()
+            enable_quant(QwT_block)
+            previous_out = QwT_block(t_out)
 
-                if (current_layer.downsample is not None) and (block_id == len(current_layer.blocks)-1):
-                    previous_out = current_layer.downsample(previous_out)
+            output_previous = torch.cat([output_previous, previous_out.detach()], dim=0)
 
-                output_previous = torch.cat([output_previous, previous_out.detach()], dim=0)
-
-                torch.cuda.synchronize()
-                if i >= (LINEAR_COMPENSATION_SAMPLES // args.batch_size // args.world_size - 1):
-                    break
+            torch.cuda.synchronize()
+            if i >= (LINEAR_COMPENSATION_SAMPLES // args.batch_size // args.world_size - 1):
+                break
 
     return q_model
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", default="swin_tiny", choices=['swin_tiny', 'swin_small'], help="model")
+parser.add_argument("--model", default="deit_tiny", choices=['vit_small', 'vit_base', 'deit_tiny', 'deit_small', 'deit_base', 'deit_tiny_distilled', 'deit_small_distilled', 'deit_base_distilled'], help="model")
 parser.add_argument('--data_dir', default='/opt/Dataset/ImageNet', type=str)
 
-parser.add_argument('--w_bits', default=4, type=int, help='bit-precision of weights')
-parser.add_argument('--a_bits', default=4, type=int, help='bit-precision of activation')
+parser.add_argument('--num_bits', default=8, type=int, help='bit-precision of weights')
 parser.add_argument('--start_block', default=0, type=int)
 
 parser.add_argument("--batch_size", default=32, type=int, help="batchsize of validation set")
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument("--seed", default=0, type=int, help="seed")
+parser.add_argument('--save_files', default=False, action='store_true')
 
 parser.add_argument("--local-rank", default=0, type=int)
 args = parser.parse_args()
@@ -256,7 +260,7 @@ if args.distributed:
 assert args.rank >= 0
 
 
-args.log_dir = os.path.join('checkpoint', args.model, 'QwT', 'bs_{}_worldsize_{}_w_{}_a_{}_startblock_{}_sed_{}'.format(args.batch_size, args.world_size, args.w_bits, args.a_bits, args.start_block, args.seed))
+args.log_dir = os.path.join('checkpoint', args.model, 'QwT', 'bs_{}_worldsize_{}_num_bits_{}_startblock_{}_sed_{}'.format(args.batch_size, args.world_size, args.num_bits, args.start_block, args.seed))
 
 args.log_file = os.path.join(args.log_dir, 'log.txt')
 
@@ -267,6 +271,8 @@ if args.local_rank == 0:
 
     if os.path.isfile(args.log_file):
         os.remove(args.log_file)
+else:
+    time.sleep(1)
 
 torch.cuda.synchronize()
 
@@ -334,98 +340,81 @@ def main():
     broadcast_tensor_from_main_process(calib_data, args)
     _write('local_rank : {} calib_data shape : {} value : {}'.format(args.local_rank, calib_data.size(), calib_data[0, 0, 0, :5]))
 
-    model_zoo = {
-        'swin_tiny' : 'swin_tiny_patch4_window7_224',
-        'swin_small': 'swin_small_patch4_window7_224'
+    base_model_zoo = {
+        'vit_small' : 'vit_small_patch16_224',
+        'vit_base' : 'vit_base_patch16_224',
+
+        'deit_tiny' : 'deit_tiny_patch16_224',
+        "deit_tiny_distilled" : "deit_tiny_distilled_patch16_224",
+        'deit_small': 'deit_small_patch16_224',
+        "deit_small_distilled": "deit_small_distilled_patch16_224",
+        'deit_base' : 'deit_base_patch16_224',
+        "deit_base_distilled": "deit_base_distilled_patch16_224",
     }
 
-    #Quant using RepQ-ViT
-    _write('Building model ...')
-    model = build_model(model_zoo[args.model], args)
-    model.to(args.device)
-    model.eval()
+    model_zoo = {
+        'vit_small' : 'vit_small_patch16_224_quant',
+        'vit_base' : 'vit_base_patch16_224_quant',
 
-    base_model = copy.deepcopy(model)
+        'deit_tiny' : 'deit_tiny_patch16_224_quant',
+        "deit_tiny_distilled" : "deit_tiny_distilled_patch16_224_quant",
+        'deit_small': 'deit_small_patch16_224_quant',
+        "deit_small_distilled": "deit_small_distilled_patch16_224_quant",
+        'deit_base' : 'deit_base_patch16_224_quant',
+        "deit_base_distilled": "deit_base_distilled_patch16_224_quant",
+    }
 
-    wq_params = {'n_bits': args.w_bits, 'channel_wise': True}
-    aq_params = {'n_bits': args.a_bits, 'channel_wise': False}
-    q_model = quant_model(model, input_quant_params=aq_params, weight_quant_params=wq_params)
-    q_model.to(args.device)
+    base_model = create_model(base_model_zoo[args.model], num_classes=args.num_classes, pretrained=True)
+
+    base_model.cuda()
+    base_model.eval()
+
+    q_model = create_model(model_zoo[args.model], num_classes=args.num_classes, pretrained=True, num_bits=args.num_bits, log_file=args.log_file, drop_path_rate=args.drop_path)
+
+    q_model.cuda()
     q_model.eval()
 
-
-    # Initial quantization
-    _write('Performing initial quantization ...')
-    set_quant_state(q_model, input_quant=True, weight_quant=True)
     with torch.no_grad():
-        _ = q_model(calib_data)
+        assert calib_data.size(0) == 32
+        collect_stats_format(q_model, calib_data)
+        compute_amax_format(q_model, calib_method='percentile')
 
-    # Scale reparameterization
-    _write('Performing scale reparameterization ...')
-    with torch.no_grad():
-        module_dict = {}
-        q_model_slice = q_model.layers if 'swin' in args.model else q_model.blocks
-        for name, module in q_model_slice.named_modules():
-            module_dict[name] = module
-            idx = name.rfind('.')
-            if idx == -1:
-                idx = 0
-            father_name = name[:idx]
-            if father_name in module_dict:
-                father_module = module_dict[father_name]
-            else:
-                raise RuntimeError(f"father module {father_name} not found")
+    q_model.cuda()
 
-            if 'norm1' in name or 'norm2' in name or 'norm' in name:
-                if 'norm1' in name:
-                    next_module = father_module.attn.qkv
-                elif 'norm2' in name:
-                    next_module = father_module.mlp.fc1
-                else:
-                    next_module = father_module.reduction
-
-                act_delta = next_module.input_quantizer.delta.reshape(-1)
-                act_zero_point = next_module.input_quantizer.zero_point.reshape(-1)
-                act_min = -act_zero_point * act_delta
-
-                target_delta = torch.mean(act_delta)
-                target_zero_point = torch.mean(act_zero_point)
-                target_min = -target_zero_point * target_delta
-
-                r = act_delta / target_delta
-                b = act_min / r - target_min
-
-                module.weight.data = module.weight.data / r
-                module.bias.data = module.bias.data / r - b
-
-                next_module.weight.data = next_module.weight.data * r
-                if next_module.bias is not None:
-                    next_module.bias.data = next_module.bias.data + torch.mm(next_module.weight.data, b.reshape(-1, 1)).reshape(-1)
-                else:
-                    next_module.bias = Parameter(torch.Tensor(next_module.out_features))
-                    next_module.bias.data = torch.mm(next_module.weight.data, b.reshape(-1, 1)).reshape(-1)
-
-                next_module.input_quantizer.channel_wise = False
-                next_module.input_quantizer.delta = target_delta
-                next_module.input_quantizer.zero_point = target_zero_point
-                next_module.weight_quantizer.inited = False
-
-    # Re-calibration
-    set_quant_state(q_model, input_quant=True, weight_quant=True)
-    with torch.no_grad():
-        _ = q_model(calib_data)
+    base_params = compute_quantized_params(base_model, local_rank=args.local_rank, log_file=args.log_file)
+    _write('FP32 model size is {:.3f}'.format(base_params))
+    top1_acc_eval = validate(base_model, loader_eval)
+    _write('FP32   eval_acc: {:.2f}'.format(top1_acc_eval.avg))
 
     ptq_params = compute_quantized_params(q_model, local_rank=args.local_rank, log_file=args.log_file)
-    _write('RepQ-ViT model size is {:.3f}'.format(ptq_params))
+    _write('PTQ model size is {:.3f}'.format(ptq_params))
     top1_acc_eval = validate(q_model, loader_eval)
-    _write('RepQ-ViT   eval_acc: {:.2f}'.format(top1_acc_eval.avg))
+    _write('PTQ   eval_acc: {:.2f}'.format(top1_acc_eval.avg))
+
+    if args.save_files and (args.local_rank == 0):
+        if args.num_bits == 8:
+            onnx_export(q_model,  torch.randn(64, 3, 224, 224, device='cuda'), 'ptq')
+            onnx_export(base_model, torch.randn(64, 3, 224, 224, device='cuda'), 'fp32')
+    torch.cuda.synchronize()
 
     q_model = generate_compensation_model(q_model, loader_train, args)
 
-    qwerty_params = compute_quantized_params(q_model, local_rank=args.local_rank, log_file=args.log_file)
-    _write('RepQ-ViT + QwT model size is {:.3f}'.format(qwerty_params))
+    if args.local_rank == 0:
+        for n, m in q_model.named_modules():
+            if isinstance(m, quant_nn.TensorQuantizer):
+                _write('quant module : {}, calibrator : {}, enable_quant : {}, bits : {}'.format(n, m._calibrator, m._if_quant, m._num_bits))
+                assert m._if_quant == True
+                assert m._if_calib == False
+
+    QwT_params = compute_quantized_params(q_model, local_rank=args.local_rank, log_file=args.log_file)
+    _write('QwT model size is {:.3f}'.format(QwT_params))
     top1_acc_eval = validate(q_model, loader_eval)
-    _write('RepQ-ViT + QwT   eval_acc: {:.2f}'.format(top1_acc_eval.avg))
+    _write('QwT   eval_acc: {:.2f}'.format(top1_acc_eval.avg))
+
+    if args.save_files and (args.local_rank == 0):
+        if args.num_bits == 8:
+            onnx_export(q_model,  torch.randn(64, 3, 224, 224, device='cuda'), 'QwT')
+    torch.cuda.synchronize()
 
 
 def validate(model, loader):

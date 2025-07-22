@@ -102,7 +102,7 @@ class FeatureDataset(Dataset):
     def __getitem__(self, item):
         return self.X[item]
 
-def lienar_regression(X, Y, block_id=0):
+def linear_regression(X, Y, block_id=0):
     X = X.reshape(-1, X.size(-1))
 
     X = gather_tensor_from_multi_processes(X, world_size=args.world_size)
@@ -176,7 +176,7 @@ def generate_compensation_model(q_model, train_loader, args):
                 break
 
         assert torch.sum((output_previous - output_t_).abs()) < 1e-3
-        W, b, r2_score = lienar_regression(output_t_, output_full_precision - output_quant, block_id=block_id)
+        W, b, r2_score = linear_regression(output_t_, output_full_precision - output_quant, block_id=block_id)
         q_model.blocks[block_id] = CompensationBlock(W=W, b=b, r2_score=r2_score, block=q_model.blocks[block_id], linear_init=True if block_id >= args.start_block else False, local_rank=args.local_rank, block_id=block_id)
         q_model.cuda()
 
