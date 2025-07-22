@@ -6,10 +6,10 @@ The following instructions explain how to reproduce QwT’s ImageNet classificat
 
 To reproduce our results, set up your environment as follows:
 
-### Recommended dependencies
+#### Recommended dependencies
 - timm 0.4.12  
-- pytorch = 2.4  
-- pytorch_quantization (2.1.2)  
+- pytorch 2.4  
+- pytorch_quantization 2.1.2 
 - [nvidia‑tensorrt 10.4](https://docs.nvidia.com/deeplearning/tensorrt/archives/tensorrt-1040/index.html)
 
 
@@ -53,8 +53,7 @@ To reproduce our results, set up your environment as follows:
      $TENSORRT_HOME/python/tensorrt-*.whl \
    $TENSORRT_HOME/python/tensorrt_lean-*.whl \
    $TENSORRT_HOME/python/tensorrt_dispatch-*.whl \
-
-```
+    ```
 
 ## Evaluation
 

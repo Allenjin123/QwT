@@ -30,7 +30,7 @@ Implementation of **QwT**, a simple, fast, and general approach to network quant
 
 ## 📌 Changelog
 
-- **2025-07-22**: Released code implementing QwT with pytorch‑percentile, along with latency‑testing scripts to reproduce the results in Table 2 of our paper <img src="imgs/new.gif" alt="NEW" width="40"/>
+- **2025-07-22**: Released code implementing QwT with pytorch‑percentile, along with latency‑testing scripts to reproduce the results in Table 2 of our paper. <img src="imgs/new.gif" alt="NEW" width="40"/>
 - **2025-06-23**: Release code implementing QwT + ResNet, evaluated on ImageNet.
 - **2025-06-09**: Release code showcasing QwT integrated with the baseline PTQ method RepQ-ViT for both classification and detection tasks.
 - **2025-02-27**: QwT is accepted by CVPR 2025 [link](https://openaccess.thecvf.com/content/CVPR2025/html/Fu_Quantization_without_Tears_CVPR_2025_paper.html).
