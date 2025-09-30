@@ -26,18 +26,21 @@ Organize the **ImageNet validation** directory in the standard layout:
   ...
 ```
 
-### 3.2 Small calibration set (WebDataset)
-We only need **512 images** for calibration. You can simply download **one shard** from CC3M WebDataset, e.g. `cc3m-train-0000.tar` from [Hugging Face](https://huggingface.co/datasets/pixparse/cc3m-wds/tree/main).
+### 3.2 Full calibration set (WebDataset)
 
-Example config:
-```
---train-data "/path/to/cc3m-train-0000.tar" \
+To **reproduce our reported results**, please use the **full CC3M WebDataset** for calibration (all shards). Small subsets (e.g., 512 images) lead to **unstable or optimistic variance**, especially at low bit-widths, and cannot guarantee the paper’s numbers.
+
+**Example config (brace expansion over all shards):**
+```angular2html
+--train-data "/path/to/cc3m-train-{0000..0575}.tar"
 --dataset-type webdataset
 ```
-Notes:
-- No brace expansion is required; a **single `.tar` file** is sufficient.
-- You may substitute any WebDataset shard that has ≥512 pairs, or your own small tarball.
-- For **image‑only PTQ** the forward pass does not use captions, but keeping real captions preserves the loader format.
+
+**Notes**
+- Use the **entire CC3M shard list** to obtain stable calibration statistics.
+- For **quick debugging only**, you may start with a few shards (e.g., `{0000..0003}`) to verify the pipeline, but **do not** expect final accuracy from such subsets.
+- For **image-only PTQ**, the forward pass does not consume captions; however, keeping real captions in shards preserves the loader format and makes it easy to switch to all-modules PTQ later.
+
 
 ---
 
@@ -61,15 +64,15 @@ python main.py \
   --choice image_only \
   --model "ViT-B/32" \
   --imagenet-val /path/to/imagenet/val \
-  --train-data "/path/to/cc3m-0000.tar" \
+  --train-data "/path/to/cc3m-train-{0000..0575}.tar" \
   --dataset-type webdataset \
   --batch-size 128 \
   --iter 4 \
   --wq_params 6 --aq_params 6 \
   (--qwerty)
 ```
-* Add `--qwerty` to enable **QwT** compensation (recommended for low‑bit).
-*`--wq_parmas` and `--aq_params` specify the quantization bitwise.
+* Add `--qwerty` to enable **QwT** compensation (recommended for low‑bit).   
+* `--wq_parmas` and `--aq_params` specify the quantization bitwise.
 
 ### 3.3 All‑modules PTQ (visual + text)
 Quantize **both** encoders for **retrieval / zero‑shot** usage.
@@ -78,7 +81,7 @@ python main.py \
   --choice all_quant \
   --model "ViT-B/32" \
   --imagenet-val /path/to/imagenet/val \
-  --train-data "/path/to/cc3m-0000.tar" \
+  --train-data "/path/to/cc3m-train-{0000..0575}.tar" \
   --dataset-type webdataset \
   --batch-size 128 \
   --iter 4 \
