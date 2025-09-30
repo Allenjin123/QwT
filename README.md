@@ -30,7 +30,8 @@ Implementation of **QwT**, a simple, fast, and general approach to network quant
 
 ## 📌 Changelog
 
-- **2025-07-22**: Released code implementing QwT with pytorch‑percentile, along with latency‑testing scripts to reproduce the results in Table 2 of our paper. <img src="imgs/new.gif" alt="NEW" width="40"/>
+- **2025-09-30**: Release code implementing QwT + RepQ-ViT for CLIP-based multimodal recognition. <img src="imgs/new.gif" alt="NEW" width="40"/>
+- **2025-07-22**: Release code implementing QwT with pytorch‑percentile, along with latency‑testing scripts to reproduce the results in Table 2 of our paper.
 - **2025-06-23**: Release code implementing QwT + ResNet, evaluated on ImageNet.
 - **2025-06-09**: Release code showcasing QwT integrated with the baseline PTQ method RepQ-ViT for both classification and detection tasks.
 - **2025-02-27**: QwT is accepted by CVPR 2025 [link](https://openaccess.thecvf.com/content/CVPR2025/html/Fu_Quantization_without_Tears_CVPR_2025_paper.html).
@@ -51,6 +52,7 @@ Implementation of **QwT**, a simple, fast, and general approach to network quant
 
 For detailed reproduction instructions, please refer to:
 
+- [**QwT-CLIP-Classification (RepQ‑ViT) README**](https://github.com/wujx2001/QwT/tree/main/QwT-mm-RepQ-ViT) — Reproduce QwT zero-shot classification results using RepQ‑ViT on CLIP model.  
 - [**QwT-Classification (PyTorch‑Percentile) README**](https://github.com/wujx2001/QwT/blob/main/QwT-cls-latency-test/README.md) — Reproduce QwT ImageNet classification results using the PyTorch‑Percentile method and measure inference latency.  
 - [**QwT-Classification (RepQ‑ViT) README**](https://github.com/wujx2001/QwT/blob/main/QwT-cls-RepQ-ViT/README.md) — Reproduce QwT ImageNet classification results using RepQ‑ViT (vit & swin) and the Percentile (resnet) baseline.  
 - [**QwT-Detection (RepQ‑ViT) README**](https://github.com/wujx2001/QwT/blob/main/QwT-det-RepQ-ViT/README.md) — Reproduce QwT COCO detection results using the RepQ‑ViT baseline.  
