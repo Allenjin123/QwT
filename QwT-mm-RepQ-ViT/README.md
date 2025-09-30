@@ -26,21 +26,23 @@ Organize the **ImageNet validation** directory in the standard layout:
   ...
 ```
 
-### 3.2 Full calibration set (WebDataset)
+### 2.2 Global-sampled calibration set (WebDataset)
 
-To **reproduce our reported results**, please use the **full CC3M WebDataset** for calibration (all shards). Small subsets (e.g., 512 images) lead to **unstable or optimistic variance**, especially at low bit-widths, and cannot guarantee the paper’s numbers.
+We calibrate with **512 images randomly sampled across *all* CC3M shards** (global sampling).
 
-**Example config (brace expansion over all shards):**
-```angular2html
---train-data "/path/to/cc3m-train-{0000..0575}.tar"
---dataset-type webdataset
+**Example config:**
+```bash
+--train-data /path/to/cc3m-train-{0000..0575}.tar \
+--dataset-type webdataset \
 ```
 
-**Notes**
-- Use the **entire CC3M shard list** to obtain stable calibration statistics.
-- For **quick debugging only**, you may start with a few shards (e.g., `{0000..0003}`) to verify the pipeline, but **do not** expect final accuracy from such subsets.
-- For **image-only PTQ**, the forward pass does not consume captions; however, keeping real captions in shards preserves the loader format and makes it easy to switch to all-modules PTQ later.
+**Notes:**
 
+- Ensure the dataloader shuffles globally across shards so the 512 image-caption pairs are drawn from the entire dataset.
+
+- For quick debugging, you may temporarily narrow the brace range (e.g., {0000..0003}).
+
+- For image-only PTQ, the forward pass does not consume captions; keeping real captions preserves loader format and allows switching to all-modules PTQ later.
 
 ---
 
