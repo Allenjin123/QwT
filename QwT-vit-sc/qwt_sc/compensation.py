@@ -24,7 +24,7 @@ The SC noise is only ever read through the SC block's forward, so any kernel
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -48,14 +48,18 @@ class CompensationBlock(nn.Module):
     """
 
     def __init__(self, block: nn.Module, W: torch.Tensor, b: torch.Tensor,
-                 r2: float = 0.0, enabled: bool = True):
+                 r2: float = 0.0, enabled: bool = True,
+                 comp_module: Optional[nn.Module] = None):
         super().__init__()
         self.block = block
-        D_in, D_out = W.shape
-        self.comp = nn.Linear(D_in, D_out, bias=True)
-        with torch.no_grad():
-            self.comp.weight.copy_(W.t().contiguous())
-            self.comp.bias.copy_(b)
+        if comp_module is not None:
+            self.comp = comp_module
+        else:
+            D_in, D_out = W.shape
+            self.comp = nn.Linear(D_in, D_out, bias=True)
+            with torch.no_grad():
+                self.comp.weight.copy_(W.t().contiguous())
+                self.comp.bias.copy_(b)
         self.r2 = float(r2)
         self.enabled = bool(enabled)
 
@@ -67,20 +71,11 @@ class CompensationBlock(nn.Module):
 
 
 def closed_form_ridge(X: torch.Tensor, Y: torch.Tensor,
-                      ridge: float = 1e-2) -> tuple[torch.Tensor, torch.Tensor, float]:
+                      ridge: float = 1e-2,
+                      ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """Solve ``min_{W,b} ||Y - (X W + b)||^2 + ridge * ||W||^2`` in closed form.
 
-    Stacks an all-ones column to fit the bias, and ridges only the slope
-    (standard convention). Uses ``torch.linalg.solve`` on the ``(D+1, D+1)``
-    Gram matrix — exact, no backprop.
-
-    Args:
-        X: ``(N, D_in)`` feature matrix.
-        Y: ``(N, D_out)`` target matrix.
-        ridge: L2 regularization strength on ``W`` (not on ``b``).
-
-    Returns:
-        ``W`` ``(D_in, D_out)``, ``b`` ``(D_out,)``, ``r2`` (scalar, unregularized).
+    Stacks an all-ones column to fit the bias, ridges only the slope.
     """
     N, D = X.shape
     ones = torch.ones(N, 1, device=X.device, dtype=X.dtype)
@@ -123,6 +118,9 @@ def calibrate_qwt(
     start_block: int = 0,
     fwd_chunk: int = 32,
     avg_sc_draws: int = 1,
+    comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
+    comp_factory_variants: Optional[List[tuple]] = None,
+    comp_refit_iters: int = 0,
     log_fn: Callable[[str], None] = print,
 ) -> List[dict]:
     """Sequentially fit and install ``CompensationBlock`` wrappers on ``model_sc``.
@@ -220,25 +218,95 @@ def calibrate_qwt(
         raw_rmse = (Y_fp - Y_sc).pow(2).mean().sqrt().item()
         after_rmse = (Rg - (Xg @ W + b)).pow(2).mean().sqrt().item()
 
+        # Noise-aware refit: when the comp itself runs in SC, account for its
+        # own measured SC noise δ(X; W, r_c) := c_sc(X; W) − (X W + b) inside
+        # the LS objective. Linearizing c_sc around the current (W, b) gives
+        # a one-shot residual subtraction; iterate K times for refinement.
+        refit_log = []
+        if comp_factory is not None and comp_refit_iters > 0:
+            for it in range(comp_refit_iters):
+                tmp_comp = comp_factory(W.detach().cpu(),
+                                         b.detach().cpu()).to(device)
+                with torch.no_grad():
+                    c_actual_chunks = []
+                    for s in range(0, Xg.size(0), fwd_chunk * 257):
+                        e = min(s + fwd_chunk * 257, Xg.size(0))
+                        c_actual_chunks.append(tmp_comp(Xg[s:e]))
+                    c_actual = torch.cat(c_actual_chunks, dim=0)
+                fp_pred = Xg @ W + b
+                delta = c_actual - fp_pred
+                Rg_corr = Rg - delta
+                W_new, b_new, r2_new = closed_form_ridge(Xg, Rg_corr,
+                                                          ridge=ridge)
+                after_rmse_new = (Rg - (Xg @ W_new + b_new) - delta).pow(2).mean().sqrt().item()
+                refit_log.append({
+                    "iter": it, "r2": r2_new,
+                    "after_rmse_with_delta": after_rmse_new,
+                    "delta_rmse": delta.pow(2).mean().sqrt().item(),
+                })
+                W, b = W_new, b_new
+                r2 = r2_new
+                after_rmse = after_rmse_new
+                del tmp_comp, c_actual, c_actual_chunks, fp_pred, delta
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         enabled = (i >= start_block) and (r2 > 0.0)
+        W_cpu = W.detach().cpu()
+        b_cpu = b.detach().cpu()
+
+        # Variant selection: try each candidate comp factory, measure
+        # ||R − c_sc(X; W)|| on calibration, keep the lowest-residual one.
+        # Records the chosen variant name per block (= 1 config bit per block
+        # in hardware when len(variants) == 2).
+        chosen_variant = None
+        variant_rmses = {}
+        comp_module = None
+
+        def _measure(mod):
+            mod = mod.to(device)
+            with torch.no_grad():
+                cs = []
+                for s in range(0, Xg.size(0), fwd_chunk * 257):
+                    e = min(s + fwd_chunk * 257, Xg.size(0))
+                    cs.append(mod(Xg[s:e]))
+                c_act = torch.cat(cs, dim=0)
+            return (Rg - c_act).pow(2).mean().sqrt().item()
+
+        if comp_factory_variants is not None and len(comp_factory_variants) > 0:
+            best = None
+            for vname, vfac in comp_factory_variants:
+                cand = vfac(W_cpu, b_cpu)
+                rmse_v = _measure(cand)
+                variant_rmses[vname] = rmse_v
+                if best is None or rmse_v < best[0]:
+                    best = (rmse_v, vname, cand)
+            _, chosen_variant, comp_module = best
+        elif comp_factory is not None:
+            comp_module = comp_factory(W_cpu, b_cpu)
+
         new_block = CompensationBlock(
-            block=blk_sc, W=W.detach().cpu(), b=b.detach().cpu(),
-            r2=r2, enabled=enabled,
+            block=blk_sc, W=W_cpu, b=b_cpu,
+            r2=r2, enabled=enabled, comp_module=comp_module,
         ).to(device)
         blocks_sc_container[i] = new_block
 
         X_cur = _forward_batched(new_block, X_cur, device, fwd_chunk)
 
         dt = time.time() - t0
+        var_str = f"  var={chosen_variant}" if chosen_variant is not None else ""
         log_fn(
             f"[calib] block {i:2d}  r2={r2:+.4f}  "
-            f"rmse {raw_rmse:.4e} -> {after_rmse:.4e}  "
+            f"rmse {raw_rmse:.4e} -> {after_rmse:.4e}{var_str}  "
             f"enabled={enabled}  ({dt:.1f}s)"
         )
         report.append({
             "block": i, "r2": r2, "enabled": enabled,
             "rmse_before": raw_rmse, "rmse_after": after_rmse,
+            "variant": chosen_variant,
+            "variant_rmses": variant_rmses,
             "dt_s": dt,
+            "noise_aware_refit": refit_log,
         })
 
         del Xg, Rg, W, b

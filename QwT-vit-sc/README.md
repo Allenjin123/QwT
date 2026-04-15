@@ -61,11 +61,73 @@ report = calibrate_qwt(
     ridge=1e-2,
     fwd_chunk=32,
     avg_sc_draws=1,               # >1 to average SC realizations during calib
+    # ─── optional: SC-kernel compensator ────────────────────────────
+    # comp_factory=...,           # see "SC compensator" section below
+    # comp_factory_variants=...,  # per-block variant selection
+    # comp_refit_iters=0,         # noise-aware refit iterations
 )
 
 # 5. model_sc is now a QwT-compensated SC model. Use as-is.
 acc = evaluate(model_sc, val_loader, device)
 ```
+
+## SC compensator (run the residual itself in SC)
+
+By default `calibrate_qwt` installs an FP `nn.Linear` per block as the
+residual — fast on a GPU but requires an FP unit on an SC accelerator. To
+remove that dependency, supply a `comp_factory(W, b) → nn.Module` that
+returns an SC-kernel module instead. The closed-form ridge fit is unchanged;
+only the inference-time matmul flips to SC.
+
+```python
+from qwt_sc import calibrate_qwt
+
+# Caller supplies the SC matmul (e.g., vit_sc's SCLinear).
+def sc_comp_factory(W, b):
+    D_in, D_out = W.shape
+    layer = nn.Linear(D_in, D_out, bias=True)
+    with torch.no_grad():
+        layer.weight.copy_(W.t().contiguous())
+        layer.bias.copy_(b)
+    return SCLinear(layer, sc_prec=8, mode="bipolar")
+
+calibrate_qwt(
+    ..., comp_factory=sc_comp_factory,
+)
+```
+
+Two extra knobs:
+
+- `comp_refit_iters=K` — *noise-aware refit*: at each block, after fitting
+  `W₀` via standard ridge, measure the SC comp's actual noise
+  `δ(X; W₀, r_c) := c_sc(X; W₀) − (X W₀ + b₀)` on the calibration set, then
+  refit on `R − δ`. Linearizes `c_sc` around `W₀`. Useful in principle; in
+  practice can overshoot on early/small-residual blocks where the comp's SC
+  noise floor exceeds the residual it's trying to fit.
+
+- `comp_factory_variants=[(name, factory), ...]` — per-block variant
+  selection. The lib runs each candidate factory on the calibration set,
+  measures `‖R − c_sc(X; W)‖`, and installs the lower-residual one.
+  Records the chosen name in the per-block report (= 1 config bit per block
+  in HW when `len(variants) == 2`). Used with two Sobol scrambling configs
+  (default vs antithetic-K) — empirically close calls in our kernel because
+  value-complement antithetic gives only ~−0.15 noise correlation here.
+
+### Results: SC-comp vs FP-comp (same calibration, same eval)
+
+DINOv2 ViT-L/14 + ImageNet-1k, N=500, sc_prec=8, ridge=1e-2:
+
+| sc_config | FP-comp | SC-comp (naive) | Δ |
+|---|---:|---:|---:|
+| `qk_only`     | 0.834 | 0.810 | **−2.4 pt** (block uses D=64 per-head SNG; comp at D=1024 → independent noise) |
+| `skip_worst50`| 0.836 | **0.840** | **+0.4 pt** (block has D=1024 SC ops; pool collides with comp via cache → free control-variate cancellation) |
+
+The take-away mirrors a control-variate argument: SC-comp matches or beats
+FP-comp wherever the comp's Sobol pool overlaps a block SC op at the same
+dim. Where it doesn't, SC-comp's noise is informationally independent of
+the block residual and stacks with it. **Open work**: a head-aligned SC
+compensator that uses the block's per-head QK SNG bank inside the comp
+matmul, restoring the pool overlap on `qk_only`-style configs.
 
 That's it — no gradient, no hyperparameter search, one pass. Calibration on
 256 images for a 24-block ViT-L/14 takes roughly 3–5 min on a single consumer
