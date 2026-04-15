@@ -2,3 +2,8 @@
 -r requirements/optional.txt
 -r requirements/runtime.txt
 -r requirements/tests.txt
+
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate qwt_d2
+module load cuda/12.8.1 gcc/11.2.0
