@@ -17,7 +17,7 @@ sys.path.insert(0, EVA_DET)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
 CKPT = "/home/yjrcs/SC_V/data/pretrained/eva_coco_det.pth"
-OUT = Path(__file__).parent / "results_fp100"
+OUT = Path(__file__).parent / "results" / "fp100"
 OUT.mkdir(parents=True, exist_ok=True)
 (OUT / "vis").mkdir(exist_ok=True)
 N_EVAL = 100

@@ -33,6 +33,13 @@ __all__ = ["ViT", "SimpleFeaturePyramid", "get_vit_lr_decay_rate"]
 _shape_t = Union[int, List[int], Size]
 
 
+class MatMul(nn.Module):
+    """Identity wrapper for A @ B. Gives the matmul a named module so quantisation
+    passes can find and replace it with QuantMatMul."""
+    def forward(self, A, B):
+        return A @ B
+
+
 # steal from beit https://github.com/microsoft/unilm/tree/master/beit
 class LayerNormWithForceFP32(nn.Module):
     __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
@@ -105,6 +112,8 @@ class Attention(nn.Module):
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+        self.matmul1 = MatMul()  # q @ k^T  (pre-softmax)
+        self.matmul2 = MatMul()  # attn @ v (post-softmax)
 
         self.use_rel_pos = use_rel_pos
         self.interp_type = interp_type
@@ -131,16 +140,16 @@ class Attention(nn.Module):
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         if self.qk_float:
-            attn = (q.float() * self.scale) @ k.float().transpose(-2, -1)
+            attn = self.matmul1(q.float() * self.scale, k.float().transpose(-2, -1))
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W), self.interp_type)
             attn = attn.softmax(dim=-1).type_as(x)
         else:
-            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = self.matmul1(q * self.scale, k.transpose(-2, -1))
             if self.use_rel_pos:
                 attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W), self.interp_type)
             attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = self.matmul2(attn, v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x

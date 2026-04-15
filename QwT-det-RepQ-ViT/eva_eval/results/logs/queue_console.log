@@ -1,0 +1,5 @@
+[queue] >>> v00_fp100
+    [bbox] AP=68.73  AP50=87.25  AP75=73.22
+    [segm] AP=61.61  AP50=86.51  AP75=66.44
+[queue] <<< v00_fp100 done in 123s
+[queue] >>> v01_w8a8_rp  (W=8 A=8 extra='--reparam')
