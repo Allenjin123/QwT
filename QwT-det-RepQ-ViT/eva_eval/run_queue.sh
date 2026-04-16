@@ -14,14 +14,23 @@ echo "=== queue started $(date) ===" > "$STATUS"
 
 run() {
   local tag="$1"; local w="$2"; local a="$3"; local extra="$4"
+  if [ -f "results/${tag}/metrics.json" ]; then
+    echo "[queue] === skip $tag (metrics.json already present)" | tee -a "$STATUS"
+    grep -E "\"AP\":" "results/${tag}/metrics.json" | head -4 | tee -a "$STATUS"
+    return 0
+  fi
   echo "[queue] >>> $tag  (W=$w A=$a extra='$extra')" | tee -a "$STATUS"
   local t0=$SECONDS
-  EXTRA="$extra" ./run_multi.sh $w $a $tag 2>&1 | tail -60 > "results/logs/queue_${tag}.log" || {
+  # Stream full output (tee) to queue_<tag>.log so errors aren't lost in buffering
+  EXTRA="$extra" ./run_multi.sh $w $a $tag 2>&1 | tee "results/logs/queue_${tag}.log" > /dev/null || {
     echo "[queue] !!! $tag FAILED" | tee -a "$STATUS"
+    echo "---tail of run log---" | tee -a "$STATUS"
+    tail -40 "results/logs/queue_${tag}.log" | tee -a "$STATUS"
+    echo "---tail of shard logs---" | tee -a "$STATUS"
+    tail -20 results/${tag}/logs/shard*.log 2>/dev/null | tee -a "$STATUS"
     return 1
   }
   local dt=$((SECONDS - t0))
-  # Print summary line from the run's own log
   grep -E "\[bbox\] AP|\[segm\] AP|ΔAP" "results/logs/queue_${tag}.log" | tee -a "$STATUS"
   echo "[queue] <<< $tag done in ${dt}s" | tee -a "$STATUS"
 }

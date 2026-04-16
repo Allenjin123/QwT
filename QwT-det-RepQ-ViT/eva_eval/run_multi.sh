@@ -20,7 +20,7 @@ mkdir -p results/${TAG}/logs
 echo "[launcher] W${W}/A${A} across ${N_GPU} GPUs, tag=${TAG}"
 pids=()
 for i in $(seq 0 $((N_GPU-1))); do
-  CUDA_VISIBLE_DEVICES=$i python quant_eval_shard.py \
+  CUDA_VISIBLE_DEVICES=$i python -u quant_eval_shard.py \
       --w-bits $W --a-bits $A \
       --shard-idx $i --n-shards $N_GPU \
       --n-eval $N_EVAL --tag $TAG $EXTRA \

@@ -4,7 +4,7 @@ keep all use_*_quant=False, run fp_smoke image. Output must match FP exactly.
 import os, sys
 import torch, cv2
 
-os.environ.setdefault("DETECTRON2_DATASETS", "/home/yjrcs/SC_V/data")
+os.environ.setdefault("DETECTRON2_DATASETS", "/scratch/nbleier_owned_root/nbleier_owned1/shared_data")
 EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det"
 sys.path.insert(0, EVA_DET)
 sys.path.insert(0, "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_eval")
@@ -15,8 +15,8 @@ from quant import quant_model_eva, set_quant_state
 from quant.quant_modules import QuantConv2d, QuantLinear, QuantMatMul
 
 CFG = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
-CKPT = "/home/yjrcs/SC_V/data/pretrained/eva_coco_det.pth"
-IMG = "/home/yjrcs/SC_V/data/coco/val2017/000000000139.jpg"
+CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
+IMG = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/coco/val2017/000000000139.jpg"
 
 cfg = LazyConfig.load(CFG)
 cfg.model.backbone.net.use_act_checkpoint = False

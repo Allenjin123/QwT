@@ -11,12 +11,12 @@ import torch
 import cv2
 import numpy as np
 
-os.environ.setdefault("DETECTRON2_DATASETS", "/home/yjrcs/SC_V/data")
+os.environ.setdefault("DETECTRON2_DATASETS", "/scratch/nbleier_owned_root/nbleier_owned1/shared_data")
 EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det"
 sys.path.insert(0, EVA_DET)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
-CKPT = "/home/yjrcs/SC_V/data/pretrained/eva_coco_det.pth"
+CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
 OUT = Path(__file__).parent / "results" / "fp100"
 OUT.mkdir(parents=True, exist_ok=True)
 (OUT / "vis").mkdir(exist_ok=True)
