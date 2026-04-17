@@ -1,0 +1,32 @@
+=== queue started Thu Apr 16 14:12:48 EDT 2026 ===
+[queue] === skip v01_w8a8_rp (metrics.json already present)
+    "AP": 67.62930297281856,
+    "AP": 61.06575903280598,
+[queue] === skip v02_w6a6_rp (metrics.json already present)
+    "AP": 67.50794072065031,
+    "AP": 60.72825246750363,
+[queue] >>> v03_w4a4_rp  (W=4 A=4 extra='--reparam')
+  [bbox] AP=53.88  AP50=70.40  AP75=57.71
+  [segm] AP=46.08  AP50=66.52  AP75=49.98
+    [bbox] ΔAP=-14.85  ΔAP50=-16.85
+    [segm] ΔAP=-15.53  ΔAP50=-19.99
+[queue] <<< v03_w4a4_rp done in 473s
+[queue] >>> v04_w8a8_rp_qwt  (W=8 A=8 extra='--reparam --qwt --qwt-n-samples 32')
+  [bbox] AP=67.62  AP50=87.04  AP75=71.95
+  [segm] AP=60.88  AP50=87.02  AP75=64.30
+    [bbox] ΔAP=-1.11  ΔAP50=-0.21
+    [segm] ΔAP=-0.73  ΔAP50=+0.51
+[queue] <<< v04_w8a8_rp_qwt done in 755s
+[queue] >>> v05_w6a6_rp_qwt  (W=6 A=6 extra='--reparam --qwt --qwt-n-samples 32')
+  [bbox] AP=67.70  AP50=87.51  AP75=72.31
+  [segm] AP=61.12  AP50=86.83  AP75=64.87
+    [bbox] ΔAP=-1.03  ΔAP50=+0.26
+    [segm] ΔAP=-0.49  ΔAP50=+0.32
+[queue] <<< v05_w6a6_rp_qwt done in 734s
+[queue] >>> v06_w4a4_rp_qwt  (W=4 A=4 extra='--reparam --qwt --qwt-n-samples 32')
+  [bbox] AP=62.10  AP50=79.99  AP75=65.39
+  [segm] AP=53.13  AP50=77.08  AP75=57.61
+    [bbox] ΔAP=-6.63  ΔAP50=-7.26
+    [segm] ΔAP=-8.47  ΔAP50=-9.43
+[queue] <<< v06_w4a4_rp_qwt done in 765s
+=== queue finished Thu Apr 16 14:58:15 EDT 2026 ===

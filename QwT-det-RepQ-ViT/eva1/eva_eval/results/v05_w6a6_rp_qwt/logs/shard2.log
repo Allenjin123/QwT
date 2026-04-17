@@ -1,0 +1,58 @@
+[shard 2/4] slice [50:75]  W6/A6  -> pred_shard2.pth
+/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det/detectron2/config/lazy.py:154: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  return old_import(name, globals, locals, fromlist=fromlist, level=level)
+[shard 2] collapsed beit_like qkv_bias on 40 attentions
+[shard 2] QuantLinear=160 QuantConv2d=1 QuantMatMul=80
+[shard 2] calibrating on 5 images...
+/home/yjrcs/miniconda3/envs/qwt_d2/lib/python3.10/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+[shard 2] calib 217.7s
+  [reparam blocks.0.norm1] C=1408 live=1393/1408 r=[0.003,19.846] b=[-3.074,3.128]
+  [reparam blocks.0.norm2] C=1408 live=1273/1408 r=[0.009,14.473] b=[-4.000,4.027]
+[shard 2] scale reparam on 80 (LN, Linear) pairs
+[shard 2] re-calib (post-reparam) 8.8s
+[shard 2] [qwt] collecting first-block inputs: need ~32 images
+[shard 2] [qwt] X_0 shape=(32, 80, 80, 1408)  dtype=torch.float32
+[shard 2] [qwt] blk  0  r2=+0.2191  rmse 6.365e-02 -> 5.306e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk  1  r2=+0.6450  rmse 5.026e-02 -> 2.651e-02  init=linear  (5.2s)
+[shard 2] [qwt] blk  2  r2=+0.4012  rmse 2.981e-02 -> 2.105e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk  3  r2=+0.2758  rmse 3.380e-02 -> 2.667e-02  init=linear  (9.8s)
+[shard 2] [qwt] blk  4  r2=+0.3078  rmse 2.148e-02 -> 1.606e-02  init=linear  (5.4s)
+[shard 2] [qwt] blk  5  r2=+0.3619  rmse 2.298e-02 -> 1.651e-02  init=linear  (5.4s)
+[shard 2] [qwt] blk  6  r2=+0.3493  rmse 2.458e-02 -> 1.691e-02  init=linear  (5.2s)
+[shard 2] [qwt] blk  7  r2=+0.3641  rmse 3.744e-02 -> 2.861e-02  init=linear  (9.9s)
+[shard 2] [qwt] blk  8  r2=+0.4072  rmse 2.721e-02 -> 1.781e-02  init=linear  (5.4s)
+[shard 2] [qwt] blk  9  r2=+0.3273  rmse 2.126e-02 -> 1.599e-02  init=linear  (5.6s)
+[shard 2] [qwt] blk 10  r2=+0.3726  rmse 2.340e-02 -> 1.723e-02  init=linear  (5.6s)
+[shard 2] [qwt] blk 11  r2=+0.3176  rmse 2.949e-02 -> 2.326e-02  init=linear  (11.1s)
+[shard 2] [qwt] blk 12  r2=+0.4025  rmse 2.236e-02 -> 1.515e-02  init=linear  (5.0s)
+[shard 2] [qwt] blk 13  r2=+0.3687  rmse 2.307e-02 -> 1.676e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk 14  r2=+0.2665  rmse 2.238e-02 -> 1.776e-02  init=linear  (5.3s)
+[shard 2] [qwt] blk 15  r2=+0.5747  rmse 3.795e-02 -> 2.354e-02  init=linear  (10.5s)
+[shard 2] [qwt] blk 16  r2=+0.3306  rmse 1.934e-02 -> 1.460e-02  init=linear  (4.7s)
+[shard 2] [qwt] blk 17  r2=+0.2819  rmse 1.793e-02 -> 1.437e-02  init=linear  (5.4s)
+[shard 2] [qwt] blk 18  r2=+0.2751  rmse 1.807e-02 -> 1.433e-02  init=linear  (5.5s)
+[shard 2] [qwt] blk 19  r2=+0.5101  rmse 3.226e-02 -> 2.171e-02  init=linear  (10.8s)
+[shard 2] [qwt] blk 20  r2=+0.6168  rmse 2.625e-02 -> 1.558e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk 21  r2=+0.8423  rmse 4.681e-02 -> 1.794e-02  init=linear  (5.0s)
+[shard 2] [qwt] blk 22  r2=+0.9479  rmse 8.737e-02 -> 1.927e-02  init=linear  (5.8s)
+[shard 2] [qwt] blk 23  r2=+0.9757  rmse 1.544e-01 -> 2.312e-02  init=linear  (9.8s)
+[shard 2] [qwt] blk 24  r2=+0.9872  rmse 1.500e-01 -> 1.630e-02  init=linear  (5.7s)
+[shard 2] [qwt] blk 25  r2=+0.9597  rmse 1.013e-01 -> 1.956e-02  init=linear  (5.5s)
+[shard 2] [qwt] blk 26  r2=+0.2381  rmse 3.578e-02 -> 3.025e-02  init=linear  (5.2s)
+[shard 2] [qwt] blk 27  r2=+0.9777  rmse 2.875e-01 -> 4.186e-02  init=linear  (10.0s)
+[shard 2] [qwt] blk 28  r2=+0.9811  rmse 2.300e-01 -> 3.079e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk 29  r2=+0.3478  rmse 4.237e-02 -> 3.312e-02  init=linear  (5.5s)
+[shard 2] [qwt] blk 30  r2=+0.9304  rmse 6.539e-02 -> 1.669e-02  init=linear  (5.5s)
+[shard 2] [qwt] blk 31  r2=+0.5165  rmse 4.475e-02 -> 3.028e-02  init=linear  (10.2s)
+[shard 2] [qwt] blk 32  r2=+0.6886  rmse 3.400e-02 -> 1.787e-02  init=linear  (4.7s)
+[shard 2] [qwt] blk 33  r2=+0.8600  rmse 5.062e-02 -> 1.767e-02  init=linear  (5.2s)
+[shard 2] [qwt] blk 34  r2=+0.6442  rmse 3.388e-02 -> 1.937e-02  init=linear  (5.8s)
+[shard 2] [qwt] blk 35  r2=+0.5993  rmse 5.432e-02 -> 3.255e-02  init=linear  (10.1s)
+[shard 2] [qwt] blk 36  r2=+0.7914  rmse 5.063e-02 -> 2.177e-02  init=linear  (5.1s)
+[shard 2] [qwt] blk 37  r2=+0.6770  rmse 4.493e-02 -> 2.423e-02  init=linear  (5.0s)
+[shard 2] [qwt] blk 38  r2=+0.8108  rmse 4.415e-02 -> 1.786e-02  init=linear  (5.3s)
+[shard 2] [qwt] blk 39  r2=+0.9702  rmse 3.559e-01 -> 5.865e-02  init=linear  (10.4s)
+[shard 2] QwT compensation done in 317.2s r2: min=0.219 mean=0.568 max=0.987
+[shard 2] inference on 25 imgs: 43.9s (1.75s/img)
+[shard 2] saved /home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_eval/results/v05_w6a6_rp_qwt/pred_shard2.pth

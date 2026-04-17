@@ -1,0 +1,15 @@
+[shard 2/4] slice [50:75]  W4/A4  -> pred_shard2.pth
+/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det/detectron2/config/lazy.py:154: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  return old_import(name, globals, locals, fromlist=fromlist, level=level)
+[shard 2] collapsed beit_like qkv_bias on 40 attentions
+[shard 2] QuantLinear=160 QuantConv2d=1 QuantMatMul=80
+[shard 2] calibrating on 5 images...
+/home/yjrcs/miniconda3/envs/qwt_d2/lib/python3.10/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+[shard 2] calib 220.4s
+  [reparam blocks.0.norm1] C=1408 live=1393/1408 r=[0.004,23.722] b=[-2.564,2.732]
+  [reparam blocks.0.norm2] C=1408 live=1275/1408 r=[0.009,13.785] b=[-3.656,4.076]
+[shard 2] scale reparam on 80 (LN, Linear) pairs
+[shard 2] re-calib (post-reparam) 8.8s
+[shard 2] inference on 25 imgs: 47.1s (1.88s/img)
+[shard 2] saved /home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_eval/results/v03_w4a4_rp/pred_shard2.pth
