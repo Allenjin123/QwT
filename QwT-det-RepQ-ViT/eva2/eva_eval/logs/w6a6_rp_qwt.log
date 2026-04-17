@@ -1,0 +1,93 @@
+
+============================================================
+  w6a6_rp_qwt
+============================================================
+/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva2/eva_det/detectron2/config/lazy.py:154: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  return old_import(name, globals, locals, fromlist=fromlist, level=level)
+The checkpoint state_dict contains keys that are not used by the model:
+  pixel_mean
+  pixel_std
+======== shape of rope freq torch.Size([256, 64]) ========
+======== shape of rope freq torch.Size([9216, 64]) ========
+[collapse] 24 blocks
+[calib] 32 images...
+/home/yjrcs/miniconda3/envs/qwt_d2/lib/python3.10/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4314.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+  calib 8/32
+  calib 16/32
+  calib 24/32
+  calib 32/32
+[calib] done
+  [reparam blocks.0.norm1->q/k/v] C=1024 live=1022/1024 r=[0.002,12.308]
+  [reparam blocks.0.norm2->w1/w2] C=1024 live=892/1024 r=[0.008,6.269]
+[reparam] 72 pairs
+[re-calib] 32 images...
+  calib 8/32
+  calib 16/32
+  calib 24/32
+  calib 32/32
+[re-calib] done
+  [qwt] collecting first-block inputs: need ~32 images
+  [qwt] X_0 shape=(32, 96, 96, 1024)  dtype=torch.float32
+  [qwt] blk  0  r2=+0.1027  rmse 1.049e-01 -> 6.279e-02  init=linear  (4.5s)
+  [qwt] blk  1  r2=+0.5457  rmse 8.473e-02 -> 4.633e-02  init=linear  (4.7s)
+  [qwt] blk  2  r2=+0.3383  rmse 5.913e-02 -> 3.944e-02  init=linear  (13.8s)
+  [qwt] blk  3  r2=+0.2787  rmse 5.935e-02 -> 4.144e-02  init=linear  (4.3s)
+  [qwt] blk  4  r2=+0.3166  rmse 8.329e-02 -> 5.148e-02  init=linear  (4.4s)
+  [qwt] blk  5  r2=+0.3728  rmse 1.054e-01 -> 7.247e-02  init=linear  (13.8s)
+  [qwt] blk  6  r2=+0.3369  rmse 9.368e-02 -> 6.249e-02  init=linear  (4.4s)
+  [qwt] blk  7  r2=+0.3297  rmse 9.266e-02 -> 6.382e-02  init=linear  (4.4s)
+  [qwt] blk  8  r2=+0.4843  rmse 1.592e-01 -> 1.004e-01  init=linear  (14.0s)
+  [qwt] blk  9  r2=+0.4496  rmse 1.225e-01 -> 7.923e-02  init=linear  (4.4s)
+  [qwt] blk 10  r2=+0.4925  rmse 1.392e-01 -> 8.041e-02  init=linear  (4.4s)
+  [qwt] blk 11  r2=+0.3477  rmse 1.179e-01 -> 8.157e-02  init=linear  (13.9s)
+  [qwt] blk 12  r2=+0.4330  rmse 1.262e-01 -> 6.914e-02  init=linear  (4.4s)
+  [qwt] blk 13  r2=+0.4823  rmse 1.169e-01 -> 6.317e-02  init=linear  (4.3s)
+  [qwt] blk 14  r2=+0.4657  rmse 1.380e-01 -> 7.405e-02  init=linear  (13.6s)
+  [qwt] blk 15  r2=+0.4874  rmse 9.924e-02 -> 5.893e-02  init=linear  (3.9s)
+  [qwt] blk 16  r2=+0.5387  rmse 1.015e-01 -> 5.478e-02  init=linear  (4.7s)
+  [qwt] blk 17  r2=+0.4829  rmse 1.113e-01 -> 7.017e-02  init=linear  (14.0s)
+  [qwt] blk 18  r2=+0.4987  rmse 9.539e-02 -> 5.253e-02  init=linear  (4.4s)
+  [qwt] blk 19  r2=+0.4459  rmse 7.676e-02 -> 4.899e-02  init=linear  (4.4s)
+  [qwt] blk 20  r2=+0.4454  rmse 1.219e-01 -> 8.030e-02  init=linear  (13.8s)
+  [qwt] blk 21  r2=+0.3878  rmse 9.148e-02 -> 6.662e-02  init=linear  (4.4s)
+  [qwt] blk 22  r2=+0.4295  rmse 9.517e-02 -> 6.803e-02  init=linear  (4.4s)
+  [qwt] blk 23  r2=+0.4120  rmse 1.510e-01 -> 1.126e-01  init=linear  (13.8s)
+[qwt] done in 234.9s  r2: min=0.103 mean=0.413 max=0.546
+[eval] 100 images...
+Loading and preparing results...
+DONE (t=0.00s)
+creating index...
+index created!
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.608
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.777
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.670
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.454
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.678
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.789
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.475
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.684
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.693
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.527
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.735
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.847
+Loading and preparing results...
+DONE (t=0.01s)
+creating index...
+index created!
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.547
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.770
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.602
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.341
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.595
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.747
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.433
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.619
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.627
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.428
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.644
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.793
+[eval] done in 197.5s
+  [bbox] AP=60.83  AP50=77.72  AP75=66.97
+  [segm] AP=54.75  AP50=76.97  AP75=60.19
+[save] /home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva2/eva_eval/results/quant_rp_qwt/w6a6_rp_qwt.json

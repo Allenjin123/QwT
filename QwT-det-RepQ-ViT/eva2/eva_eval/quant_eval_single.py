@@ -1,5 +1,8 @@
-"""Quantised eval on first 100 COCO val images — EVA-02-L.
-Runs w8a8, w6a6, w4a4 with reparam, then with reparam+qwt, sequentially.
+"""Run a single bits config (reparam+qwt) on the GPU visible to this process.
+
+Usage:
+    CUDA_VISIBLE_DEVICES=0 python quant_eval_single.py 8
+    CUDA_VISIBLE_DEVICES=1 python quant_eval_single.py 6
 """
 import os, sys, time, json, copy
 from pathlib import Path
@@ -23,12 +26,12 @@ from quant import (quant_model_eva2, set_quant_state, scale_reparam_eva2,
                    collapse_qkv_bias, generate_compensation_model_eva)
 
 
-def build_eval(cfg_template, n_eval):
+def build_eval(cfg_template, n_eval, tag):
     cfg = copy.deepcopy(cfg_template)
     orig_name = cfg.dataloader.test.dataset.names
     all_items = DatasetCatalog.get(orig_name)
     subset = all_items[:n_eval]
-    sub_name = f"{orig_name}_first{n_eval}"
+    sub_name = f"{orig_name}_first{n_eval}_{tag}"
     if sub_name in DatasetCatalog.list():
         DatasetCatalog.remove(sub_name)
         MetadataCatalog.remove(sub_name)
@@ -39,7 +42,7 @@ def build_eval(cfg_template, n_eval):
     cfg.dataloader.test.dataset.names = sub_name
     test_loader = instantiate(cfg.dataloader.test)
     evaluator = COCOEvaluator(orig_name, tasks=("bbox", "segm"), distributed=False,
-                              output_dir="/tmp/eva2_quant_eval")
+                              output_dir=f"/tmp/eva2_quant_eval_{tag}")
     subset_img_ids = set(int(it["image_id"]) for it in subset)
     coco = evaluator._coco_api
     coco.imgs = {k: v for k, v in coco.imgs.items() if k in subset_img_ids}
@@ -58,15 +61,16 @@ def calib_forward(model, subset, n_calib):
             img_t = torch.as_tensor(im.astype("float32").transpose(2, 0, 1))
             model([{"image": img_t.cuda(), "height": im.shape[0], "width": im.shape[1]}])
             if (i + 1) % 8 == 0:
-                print(f"  calib {i+1}/{n_calib}")
+                print(f"  calib {i+1}/{n_calib}", flush=True)
 
 
-def run_config(bits, cfg_template, subset, use_reparam, use_qwt):
-    mode = "rp+qwt" if use_qwt else ("rp" if use_reparam else "norp")
+def run(bits, mode):
+    """mode: 'rp' (reparam only) or 'rp_qwt' (reparam + qwt)"""
     tag = f"w{bits}a{bits}_{mode}"
-    print(f"\n{'='*60}")
-    print(f"  {tag}")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}\n  {tag}\n{'='*60}", flush=True)
+
+    cfg_template = LazyConfig.load(CFG_PATH)
+    _, _, subset = build_eval(cfg_template, N_EVAL, f"{tag}_prep")
 
     cfg = copy.deepcopy(cfg_template)
     cfg.model.backbone.net.xattn = False
@@ -74,94 +78,55 @@ def run_config(bits, cfg_template, subset, use_reparam, use_qwt):
     model = instantiate(cfg.model).eval().cuda()
     DetectionCheckpointer(model).load(CKPT)
 
-    # Collapse q_bias/v_bias into proj.bias — always needed so that
-    # Attention.forward() takes the module-call path (QuantLinear fires).
     n_col = collapse_qkv_bias(model)
-    print(f"[collapse] {n_col} blocks")
+    print(f"[collapse] {n_col} blocks", flush=True)
 
-    # Quant swap
     quant_model_eva2(model, {"n_bits": bits}, {"n_bits": bits, "channel_wise": True})
     set_quant_state(model, True, True)
 
-    # Calibrate
-    print(f"[calib] {N_CALIB} images...")
+    print(f"[calib] {N_CALIB} images...", flush=True)
     calib_forward(model, subset, N_CALIB)
-    print("[calib] done")
+    print("[calib] done", flush=True)
 
-    # Reparam
-    if use_reparam:
-        n_rp = scale_reparam_eva2(model.backbone.net)
-        print(f"[reparam] {n_rp} pairs")
-        # Re-calib after reparam (weight quantizers were reset)
-        print(f"[re-calib] {N_CALIB} images...")
-        calib_forward(model, subset, N_CALIB)
-        print("[re-calib] done")
+    n_rp = scale_reparam_eva2(model.backbone.net)
+    print(f"[reparam] {n_rp} pairs", flush=True)
+    print(f"[re-calib] {N_CALIB} images...", flush=True)
+    calib_forward(model, subset, N_CALIB)
+    print("[re-calib] done", flush=True)
 
-    # QwT compensation
-    if use_qwt:
-        qwt_loader, _, _ = build_eval(cfg_template, N_EVAL)
+    if mode == "rp_qwt":
+        qwt_loader, _, _ = build_eval(cfg_template, N_EVAL, f"{tag}_qwt")
         t0 = time.time()
         report = generate_compensation_model_eva(
             model, qwt_loader, device=torch.device("cuda"),
             n_samples=32, start_block=0, ridge=0.0, fwd_chunk=1,
-            log=lambda s: print(f"  {s}"),
+            log=lambda s: print(f"  {s}", flush=True),
         )
         r2s = [r["r2"] for r in report]
         print(f"[qwt] done in {time.time()-t0:.1f}s  "
-              f"r2: min={min(r2s):.3f} mean={sum(r2s)/len(r2s):.3f} max={max(r2s):.3f}")
+              f"r2: min={min(r2s):.3f} mean={sum(r2s)/len(r2s):.3f} max={max(r2s):.3f}",
+              flush=True)
         set_quant_state(model, True, True)
 
-    # Eval
-    _, evaluator, _ = build_eval(cfg_template, N_EVAL)
-    test_loader, _, _ = build_eval(cfg_template, N_EVAL)
-    print(f"[eval] {N_EVAL} images...")
+    test_loader, evaluator, _ = build_eval(cfg_template, N_EVAL, f"{tag}_eval")
+    print(f"[eval] {N_EVAL} images...", flush=True)
     t0 = time.time()
     results = inference_on_dataset(model, test_loader, evaluator)
     dt = time.time() - t0
-    print(f"[eval] done in {dt:.1f}s")
+    print(f"[eval] done in {dt:.1f}s", flush=True)
 
     for task, m in results.items():
-        print(f"  [{task}] AP={m.get('AP',0):.2f}  AP50={m.get('AP50',0):.2f}  AP75={m.get('AP75',0):.2f}")
-
-    del model
-    torch.cuda.empty_cache()
-    return tag, results
-
-
-def main():
-    print("[0] Loading config")
-    cfg_template = LazyConfig.load(CFG_PATH)
-
-    print("[1] Preparing dataset")
-    _, _, subset = build_eval(cfg_template, N_EVAL)
+        print(f"  [{task}] AP={m.get('AP',0):.2f}  AP50={m.get('AP50',0):.2f}  "
+              f"AP75={m.get('AP75',0):.2f}", flush=True)
 
     OUT = Path(__file__).parent / "results" / "quant_rp_qwt"
     OUT.mkdir(parents=True, exist_ok=True)
-
-    all_results = {}
-
-    # reparam only
-    for bits in [8, 6, 4]:
-        tag, res = run_config(bits, cfg_template, subset, use_reparam=True, use_qwt=False)
-        all_results[tag] = res
-
-    # reparam + qwt
-    for bits in [8, 6, 4]:
-        tag, res = run_config(bits, cfg_template, subset, use_reparam=True, use_qwt=True)
-        all_results[tag] = res
-
-    with open(OUT / "summary.json", "w") as f:
-        json.dump(all_results, f, indent=2)
-
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    print(f"{'config':<18} {'bbox AP':>8} {'bbox AP50':>9} {'segm AP':>8} {'segm AP50':>9}")
-    for tag, res in all_results.items():
-        b = res.get("bbox", {})
-        s = res.get("segm", {})
-        print(f"{tag:<18} {b.get('AP',0):>8.2f} {b.get('AP50',0):>9.2f} {s.get('AP',0):>8.2f} {s.get('AP50',0):>9.2f}")
+    with open(OUT / f"{tag}.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[save] {OUT/f'{tag}.json'}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    bits = int(sys.argv[1])
+    mode = sys.argv[2] if len(sys.argv) > 2 else "rp_qwt"
+    run(bits, mode)

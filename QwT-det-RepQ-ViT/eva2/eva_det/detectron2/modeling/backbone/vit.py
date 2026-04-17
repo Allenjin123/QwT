@@ -112,9 +112,17 @@ class Attention(nn.Module):
         x = x.view(B, -1, C)
         N = H * W
 
-        q = F.linear(input=x, weight=self.q_proj.weight, bias=self.q_bias)
-        k = F.linear(input=x, weight=self.k_proj.weight, bias=None)
-        v = F.linear(input=x, weight=self.v_proj.weight, bias=self.v_bias)
+        if getattr(self, '_bias_collapsed', False):
+            # After collapse_qkv_bias(): bias lives in proj.bias, use module
+            # call so QuantLinear.forward() (input/weight quantisation) fires.
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+        else:
+            # Original path: separate q_bias / v_bias parameters
+            q = F.linear(input=x, weight=self.q_proj.weight, bias=self.q_bias)
+            k = F.linear(input=x, weight=self.k_proj.weight, bias=None)
+            v = F.linear(input=x, weight=self.v_proj.weight, bias=self.v_bias)
 
         q = q.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)     # B, num_heads, N, C
         k = k.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
