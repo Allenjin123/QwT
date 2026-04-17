@@ -12,7 +12,8 @@ import cv2
 import numpy as np
 
 os.environ.setdefault("DETECTRON2_DATASETS", "/scratch/nbleier_owned_root/nbleier_owned1/shared_data")
-EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva2/eva_det"
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+EVA_DET = os.path.join(_THIS_DIR, "..", "eva_det")
 sys.path.insert(0, EVA_DET)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/eva2_o365_to_coco/eva2_o365_to_coco_cascade_mask_rcnn_vitdet_l_8attn_1536_lrd0p8.py"

@@ -12,7 +12,7 @@
 #SBATCH --account=nbleier_owned1
 
 set -e
-cd /home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva1/eva_eval
+cd "$(dirname "$(readlink -f "$0")")"
 mkdir -p results/logs
 
 echo "[sbatch] job $SLURM_JOB_ID  node=$SLURMD_NODENAME  gpus=$SLURM_GPUS  $(date)"
