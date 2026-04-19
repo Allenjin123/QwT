@@ -2,3 +2,8 @@
 **/.idea/
 __pycache__/
 *.pth
+
+# Compiled C++ / CUDA extensions (rebuilt by pip install -e)
+*.so
+*.o
+build/
