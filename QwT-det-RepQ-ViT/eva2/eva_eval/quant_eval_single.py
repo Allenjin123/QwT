@@ -9,7 +9,8 @@ from pathlib import Path
 import torch
 
 os.environ.setdefault("DETECTRON2_DATASETS", "/scratch/nbleier_owned_root/nbleier_owned1/shared_data")
-EVA_DET = "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva2/eva_det"
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+EVA_DET = os.path.join(_THIS_DIR, "..", "eva_det")
 sys.path.insert(0, EVA_DET)
 sys.path.insert(0, "/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva2/eva_eval")
 
