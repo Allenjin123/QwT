@@ -31,6 +31,27 @@ from torch import nn
 from .compensation import closed_form_ridge
 
 
+def _sc_comp_apply(X_flat: torch.Tensor, W: torch.Tensor, b: torch.Tensor,
+                   sc_prec: int, mode: str) -> torch.Tensor:
+    """Run ``X @ W + b`` through ``scmp.sc_linear`` using the same Sobol seeds
+    the inference-time comp path will see. Returns an (N, D_out) tensor on the
+    same device as X_flat. Batches over the leading dim to stay within memory.
+
+    ``W`` has shape ``(D_in, D_out)`` per ``closed_form_ridge`` convention;
+    ``scmp.sc_linear`` expects ``(D_out, D_in)`` (nn.Linear layout), so we
+    transpose here.
+    """
+    from scmp import sc_linear
+    W_lin = W.t().contiguous().to(X_flat.device, X_flat.dtype)
+    b_lin = b.to(X_flat.device, X_flat.dtype) if b is not None else None
+    chunk = 8192
+    parts = []
+    for s in range(0, X_flat.shape[0], chunk):
+        e = min(s + chunk, X_flat.shape[0])
+        parts.append(sc_linear(X_flat[s:e], W_lin, b_lin, sc_prec, mode=mode))
+    return torch.cat(parts, dim=0)
+
+
 class BlockResidualFn(nn.Module):
     """Wraps an ``(attn, ff)`` pair so it forwards as one residual block:
 
@@ -57,6 +78,11 @@ def calibrate_block_residuals(
     avg_sc_draws: int = 1,
     start_block: int = 0,
     log_fn: Callable[[str], None] = print,
+    comp_use_sc: bool = False,
+    sc_prec: int = 8,
+    sc_mode: str = "bipolar",
+    comp_refit_iters: int = 0,
+    calib_input_noise_std: float = 0.0,
 ) -> List[dict]:
     """Sequential (Gauss-Seidel) ridge LS fit of per-block residuals.
 
@@ -90,7 +116,19 @@ def calibrate_block_residuals(
 
     device = next(sc_layers[0][0].parameters()).device
     X_cur = calib_X.to(device).float()
+    # Optional: augment calibration X with per-sample Gaussian noise to make
+    # the fit robust against the dataset-action → CEM-action distribution
+    # shift. Noise std is expressed relative to per-feature std of X_cur.
+    if calib_input_noise_std > 0.0:
+        per_feat_std = X_cur.reshape(-1, X_cur.shape[-1]).std(dim=0)
+        jitter = torch.randn_like(X_cur) * (per_feat_std * calib_input_noise_std)
+        X_cur = X_cur + jitter
+        log_fn(f"[comp-calib] calib X augmented with Gaussian "
+               f"(std={calib_input_noise_std} × per-feat-std)")
     log_fn(f"[comp-calib] X_0 shape={tuple(X_cur.shape)} dtype={X_cur.dtype}")
+    log_fn(f"[comp-calib] comp_use_sc={comp_use_sc} "
+           f"comp_refit_iters={comp_refit_iters} ridge={ridge} "
+           f"sc_prec={sc_prec} sc_mode={sc_mode}")
 
     report: List[dict] = []
     for i in range(depth):
@@ -109,13 +147,46 @@ def calibrate_block_residuals(
         X_flat = X_cur.reshape(-1, D)
         R_flat = (Y_fp - Y_sc).reshape(-1, D)
 
+        # Initial fit: assume FP comp (closed-form LS).
         W, b, r2 = closed_form_ridge(X_flat, R_flat, ridge=ridge)
         rmse_before = (Y_fp - Y_sc).pow(2).mean().sqrt().item()
-        rmse_after = (R_flat - (X_flat @ W + b)).pow(2).mean().sqrt().item()
+        rmse_after_fp = (R_flat - (X_flat @ W + b)).pow(2).mean().sqrt().item()
+
+        # Noise-aware refit: iteratively account for the SC-comp's own noise.
+        # At iteration k, measure delta_k = sc_linear(X; W_k, b_k) − (XW_k+b_k)
+        # (i.e., the nonlinear deviation the SC kernel adds), subtract it from
+        # the LS target, and re-solve. Converges in 2-3 steps in practice.
+        refit_log = []
+        rmse_after_sc = None
+        if comp_use_sc and comp_refit_iters > 0:
+            for it in range(comp_refit_iters):
+                sc_pred = _sc_comp_apply(X_flat, W, b, sc_prec, sc_mode)
+                fp_pred = X_flat @ W + b
+                delta = sc_pred - fp_pred
+                R_corr = R_flat - delta
+                W_new, b_new, r2_new = closed_form_ridge(
+                    X_flat, R_corr, ridge=ridge)
+                # RMSE using the actual SC-comp at the refitted (W, b).
+                sc_pred_new = _sc_comp_apply(X_flat, W_new, b_new,
+                                              sc_prec, sc_mode)
+                rmse_sc_new = (R_flat - sc_pred_new).pow(2).mean().sqrt().item()
+                refit_log.append({
+                    "iter": it, "r2": float(r2_new),
+                    "rmse_after_sc": float(rmse_sc_new),
+                    "delta_norm": float(delta.pow(2).mean().sqrt().item()),
+                })
+                W, b = W_new, b_new
+                r2 = r2_new
+                rmse_after_sc = rmse_sc_new
+                del sc_pred, sc_pred_new, fp_pred, delta, R_corr
 
         enabled = (i >= start_block) and (r2 > 0.0)
+        rmse_after_msg = f"{rmse_after_fp:.4e}"
+        if rmse_after_sc is not None:
+            rmse_after_msg = (f"{rmse_after_fp:.4e} (fp-lin) / "
+                              f"{rmse_after_sc:.4e} (sc-actual)")
         log_fn(f"[comp-calib] block {i}  r2={r2:+.4f}  "
-               f"rmse {rmse_before:.4e} -> {rmse_after:.4e}  "
+               f"rmse {rmse_before:.4e} -> {rmse_after_msg}  "
                f"||W||={W.norm().item():.2f} ||b||={b.norm().item():.2f}  "
                f"enabled={enabled}")
         report.append({
@@ -125,11 +196,19 @@ def calibrate_block_residuals(
             "r2": float(r2),
             "enabled": bool(enabled),
             "rmse_before": float(rmse_before),
-            "rmse_after": float(rmse_after),
+            "rmse_after": float(rmse_after_sc if rmse_after_sc is not None
+                                else rmse_after_fp),
+            "rmse_after_fp_linear": float(rmse_after_fp),
+            "refit_log": refit_log,
         })
 
+        # Gauss-Seidel: propagate the compensated output as the next block's
+        # input distribution. Use the SAME comp backend as inference.
         if enabled:
-            comp_out = X_flat @ W + b
+            if comp_use_sc:
+                comp_out = _sc_comp_apply(X_flat, W, b, sc_prec, sc_mode)
+            else:
+                comp_out = X_flat @ W + b
             X_cur = (Y_sc + comp_out.reshape(*Y_sc.shape)).detach()
         else:
             X_cur = Y_sc.detach()
