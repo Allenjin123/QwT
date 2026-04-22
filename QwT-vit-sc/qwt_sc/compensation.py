@@ -116,6 +116,7 @@ def calibrate_qwt(
     n_calib: int,
     ridge: float = 1e-2,
     start_block: int = 0,
+    min_r2: float = 0.0,
     fwd_chunk: int = 32,
     avg_sc_draws: int = 1,
     comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
@@ -251,7 +252,7 @@ def calibrate_qwt(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        enabled = (i >= start_block) and (r2 > 0.0)
+        enabled = (i >= start_block) and (r2 > min_r2)
         W_cpu = W.detach().cpu()
         b_cpu = b.detach().cpu()
 
