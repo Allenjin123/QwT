@@ -122,6 +122,12 @@ def calibrate_qwt(
     comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
     comp_factory_variants: Optional[List[tuple]] = None,
     comp_refit_iters: int = 0,
+    r2_threshold: float = 0.0,
+    max_block_for_qwt: int = 10**9,
+    last_block_r2_threshold: Optional[float] = None,
+    rmse_margin: float = 0.0,
+    lookahead_veto: bool = False,
+    tail_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     log_fn: Callable[[str], None] = print,
 ) -> List[dict]:
     """Sequentially fit and install ``CompensationBlock`` wrappers on ``model_sc``.
@@ -252,7 +258,57 @@ def calibrate_qwt(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        enabled = (i >= start_block) and (r2 > min_r2)
+        # Per-block r2 gate. `min_r2` (det-side alias) and `r2_threshold`
+        # (cls-side) are combined via max() so either caller can tighten the
+        # bar. Last block gets a stricter threshold when
+        # `last_block_r2_threshold` is provided — protects the pre-head
+        # embedding from borderline-r2 comps at the catastrophic late layer
+        # without sweeping all blocks under one conservative bar.
+        r2_thr_i = max(min_r2, r2_threshold)
+        if last_block_r2_threshold is not None and i == n_blocks - 1:
+            r2_thr_i = max(r2_thr_i, last_block_r2_threshold)
+        # rmse_margin: require raw_rmse / after_rmse > margin as an extra hurdle.
+        # Guards against knife-edge r² where LS explains variance but absolute
+        # RMSE reduction is modest — SC-comp's inference-time noise can then
+        # swamp the correction.
+        if rmse_margin > 0.0 and after_rmse > 0.0:
+            margin_ok = (raw_rmse / after_rmse) > rmse_margin
+        else:
+            margin_ok = True
+        enabled = ((i >= start_block) and (r2 > r2_thr_i)
+                   and margin_ok and (i < max_block_for_qwt))
+
+        # 1-step binary lookahead: propagate block i's output (with vs without
+        # comp) through block_fp[i+1] and compare against the reference
+        # propagation of Y_fp_i. Veto `apply` when `skip` is closer to the FP
+        # chain. Only applies when there IS a next block; last-block
+        # protection is handled by `last_block_r2_threshold`.
+        lookahead_err_apply = None
+        lookahead_err_skip  = None
+        lookahead_decision  = None
+        if enabled and lookahead_veto and (i + 1 < n_blocks):
+            with torch.no_grad():
+                delta_gpu = (Xg @ W + b).reshape(Y_sc.shape).float()
+                Y_apply = Y_sc + delta_gpu.cpu()
+                blk_fp_next = blocks_fp[i + 1]
+                Y_ref_next   = _forward_batched(blk_fp_next, Y_fp,    device, fwd_chunk)
+                Y_apply_next = _forward_batched(blk_fp_next, Y_apply, device, fwd_chunk)
+                Y_skip_next  = _forward_batched(blk_fp_next, Y_sc,    device, fwd_chunk)
+                lookahead_err_apply = (Y_ref_next - Y_apply_next).pow(2).mean().item()
+                lookahead_err_skip  = (Y_ref_next - Y_skip_next ).pow(2).mean().item()
+                del delta_gpu, Y_apply, Y_ref_next, Y_apply_next, Y_skip_next
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            if lookahead_err_skip < lookahead_err_apply:
+                lookahead_decision = "veto"
+                log_fn(
+                    f"[lookahead] block {i}: VETO apply "
+                    f"(err_apply={lookahead_err_apply:.4e} > err_skip={lookahead_err_skip:.4e})"
+                )
+                enabled = False
+            else:
+                lookahead_decision = "keep"
+
         W_cpu = W.detach().cpu()
         b_cpu = b.detach().cpu()
 
@@ -308,6 +364,13 @@ def calibrate_qwt(
             "variant_rmses": variant_rmses,
             "dt_s": dt,
             "noise_aware_refit": refit_log,
+            "lookahead_decision": lookahead_decision,   # "keep" / "veto" / None
+            "lookahead_err_apply": lookahead_err_apply,
+            "lookahead_err_skip":  lookahead_err_skip,
+            "r2_threshold_used": r2_thr_i,   # differs from r2_threshold for last block
+            "rmse_margin": rmse_margin,
+            "margin_ok": margin_ok,
+            "rmse_ratio": (raw_rmse / after_rmse) if after_rmse > 0 else float("inf"),
         })
 
         del Xg, Rg, W, b
