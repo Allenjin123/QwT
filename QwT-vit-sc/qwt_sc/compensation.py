@@ -13,18 +13,119 @@ on a small calibration set, then wrap each SC block as
     out_i(x) = block_sc_i(x) + x @ W_i + b_i.
 
 This is the direct SC-analogue of the ``CompensationBlock`` in
-``QwT-cls-RepQ-ViT/qwt_vit_and_deit.py`` (Fu et al., CVPR 2025), and inherits
-QwT's key property: **no back-prop, closed-form LS, calibration in minutes**.
+``QwT-cls-RepQ-ViT/qwt_vit_and_deit.py`` (Fu et al., CVPR 2025): no back-prop,
+closed-form LS, calibration in minutes. The routine is kernel-agnostic — any
+SC backend (XNOR/Sobol bitstream, calibrated Gaussian surrogate, etc.) is
+observed only through ``model_sc``'s forward.
 
-The routine is framework-agnostic about which SC kernels are used: it only
-needs the two block lists (FP and SC) and a way to collect block-0 inputs.
-The SC noise is only ever read through the SC block's forward, so any kernel
-(XNOR/Sobol bitstream, calibrated Gaussian surrogate, etc.) works.
+--------------------------------------------------------------------------
+The admission algorithm: cross-seed cosine gate
+--------------------------------------------------------------------------
+
+The residual ``R_i = Y_fp_i - Y_sc_i`` contains two additive components:
+
+    R_i(X) = bias_i(X)   +   noise_i(X)
+             \_____/          \______/
+             deterministic     input-dependent SC noise:
+             part of the       depends on the specific
+             SC->FP gap        (X, Sobol-state) combination
+
+Ridge LS on a single calib batch fits a single ``W_i`` that captures both
+components indistinguishably. When ``bias_i`` is *small relative to*
+``noise_i`` (the common case at high-baseline configs such as avg192, where
+the raw SC top-1 is already 84.7%), the LS solution is dominated by the
+noise component. At eval time the image distribution is different (50k vs
+1024 images, different token-level activations), the noise pattern differs,
+and ``W_i`` amplifies in a now-orthogonal direction. This "noise-fit" ``W``
+does not compensate — it injects correlated error that compounds through
+every downstream block; a single noise-fit block near the input can destroy
+the pre-head embedding and drop top-1 to 0%.
+
+The cross-seed gate discriminates signal from noise by fitting **two**
+independent ``W``'s on two disjoint calibration batches and admitting the
+block only when they agree in direction:
+
+    cos(W_A, W_B) := <flatten(W_A), flatten(W_B)> / (||W_A|| * ||W_B||)
+
+Physical meaning: a bias direction that is shared across two different
+image populations survives the change — cos ≈ 1. A noise-fit direction is
+specific to the particular images drawn, so two different draws produce
+orthogonal ``W`` — cos ≈ 0. The gap is large and regime-invariant.
+
+Admission rule, applied to every block:
+
+    admit iff  cos(W_A, W_B) > τ  AND  min(||W_A||, ||W_B||) > ε
+
+Install  ``W̄ = (W_A + W_B)/2``  and  ``b̄ = (b_A + b_B)/2``.
+
+--------------------------------------------------------------------------
+Why it supersedes the legacy heuristic gates
+--------------------------------------------------------------------------
+
+Before cross-seed, admission was gated by a combination of r²-threshold,
+cv-holdout r², rmse_before_floor, max_late_blocks (zonal cap), rmse_margin,
+last_block_r2_threshold, and rmse_before_override. Each of these is a proxy
+for "is this W signal or noise?", and each proxy leaked on one regime:
+
+  * r² > 0.4 on held-out rows: block 1 at avg192 scores 0.54 and is
+    admitted, yet generalizes terribly (the held-out rows share the
+    calib batch's noise pattern). Collapse.
+  * r² > 0.5 (opt3): by luck excludes block 1 on avg192 (in-sample r² = 0.40),
+    works on that regime but was manually discovered.
+  * max_late_blocks = 2 (V5): protects the mid-zone at p7 but does not
+    prevent early-block collapse (block 1, block 6) at avg192.
+  * rmse_before_floor: blunt — a floor that saves avg192 also rejects
+    p7's high-signal early blocks.
+
+Cross-seed is the physically correct test. It admits exactly those blocks
+where the fit survives an input-population shift, which is the same shift
+that happens between calib (1024 images) and eval (50k).
+
+--------------------------------------------------------------------------
+N=1000 pilot evidence (5 configs, ``--cos_threshold 0.5``,
+``--last_block_cos_threshold 0.8``)
+--------------------------------------------------------------------------
+
+Per-block cosines, identical bimodal structure across regimes:
+
+    config           blk0    blk1    blk2..23 (range)
+    p7_uniform      -0.05   +0.00   [+0.69, +0.93]   Δraw = +2.46
+    p8_uniform      -0.02   -0.01   [+0.70, +0.93]   Δraw = -0.57*
+    avg192_uniform  -0.01   +0.02   [+0.69, +0.93]   Δraw = +0.23
+    p7_mp           -0.01   -0.03   [+0.68, +0.90]   Δraw = +2.51
+    avg192_mp       -0.03   +0.10   [+0.69, +0.93]   Δraw = +0.48
+
+    * p8_uniform -0.57 is within N=1000 variance (σ ≈ 1.1pt at top-1 ≈ 85%);
+      expected to resolve positive at N=50k.
+
+Block 0 and block 1 are rejected on every regime (||W|| ≈ 10^3-10^4,
+cos ≈ 0). Blocks 2-23 are admitted on every regime. The separation between
+noise and signal modes is ~0.6 in cosine, so ``τ`` is insensitive inside
+[0.2, 0.65].
+
+--------------------------------------------------------------------------
+Tuning τ
+--------------------------------------------------------------------------
+
+Recommended default: ``cos_threshold = 0.5``, ``last_block_cos_threshold =
+0.8`` (block 23 feeds the pre-head embedding directly, so demand tighter
+agreement there), ``norm_floor = 0.0``. Tighten τ toward 0.65 if a regime
+admits borderline blocks that drag top-1; loosen toward 0.3 if the gate
+rejects clearly-signal blocks (unlikely given the current gap).
+
+--------------------------------------------------------------------------
+Cost
+--------------------------------------------------------------------------
+
+Two SC forwards and two ridge solves per block during calibration; in
+practice ~1.5-2× the legacy single-batch calib wall time. Negligible
+compared to N=50k evaluation. Eval path is unchanged (single installed W̄
+per admitted block).
 """
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -34,21 +135,20 @@ class CompensationBlock(nn.Module):
     """Residual linear correction wrapping an inner block.
 
     ``out = block(x) + x @ W + b``, with ``W`` of shape ``(D_in, D_out)``.
-    The correction is applied as an ``nn.Linear`` so that trailing-dim inputs
-    ``(B, N, D_in)`` are handled naturally across token dimensions.
+    The correction is an ``nn.Linear`` so trailing-dim inputs ``(B, N, D_in)``
+    are handled naturally across token dimensions.
 
     Args:
         block: the inner block (quantized / SC / anything).
         W: ``(D_in, D_out)`` tensor from the LS fit.
         b: ``(D_out,)`` tensor.
-        r2: coefficient of determination from the fit (diagnostic).
-        enabled: if ``False``, the wrapper is a no-op — useful when the fit
-            was degenerate (very low r^2) and you'd rather leave the block
-            uncompensated.
+        cos_ab: cross-seed cosine from the admission gate (diagnostic).
+        enabled: if ``False``, the wrapper is a no-op — useful when the
+            admission rule rejected the block.
     """
 
     def __init__(self, block: nn.Module, W: torch.Tensor, b: torch.Tensor,
-                 r2: float = 0.0, enabled: bool = True,
+                 cos_ab: float = 0.0, enabled: bool = True,
                  comp_module: Optional[nn.Module] = None):
         super().__init__()
         self.block = block
@@ -60,7 +160,7 @@ class CompensationBlock(nn.Module):
             with torch.no_grad():
                 self.comp.weight.copy_(W.t().contiguous())
                 self.comp.bias.copy_(b)
-        self.r2 = float(r2)
+        self.cos_ab = float(cos_ab)
         self.enabled = bool(enabled)
 
     def forward(self, x, *args, **kwargs):
@@ -75,7 +175,10 @@ def closed_form_ridge(X: torch.Tensor, Y: torch.Tensor,
                       ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """Solve ``min_{W,b} ||Y - (X W + b)||^2 + ridge * ||W||^2`` in closed form.
 
-    Stacks an all-ones column to fit the bias, ridges only the slope.
+    Stacks an all-ones column to fit the bias; ridges only the slope.
+    Returns ``(W, b, r2)`` where r² is the in-sample coefficient of
+    determination — diagnostic only under the cross-seed gate (the actual
+    admission test is ``cos(W_A, W_B)``, not r²).
     """
     N, D = X.shape
     ones = torch.ones(N, 1, device=X.device, dtype=X.dtype)
@@ -111,68 +214,64 @@ def calibrate_qwt(
     model_sc: nn.Module,
     blocks_fp: Sequence[nn.Module],
     blocks_sc_container,  # supports __getitem__ and __setitem__ (e.g. nn.ModuleList)
-    calib_loader,
+    calib_loader_a,
+    calib_loader_b,
     device: torch.device,
     n_calib: int,
     ridge: float = 1e-2,
     start_block: int = 0,
-    min_r2: float = 0.0,
     fwd_chunk: int = 32,
-    avg_sc_draws: int = 1,
-    comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
-    comp_factory_variants: Optional[List[tuple]] = None,
-    comp_refit_iters: int = 0,
-    r2_threshold: float = 0.0,
-    max_block_for_qwt: int = 10**9,
-    last_block_r2_threshold: Optional[float] = None,
-    rmse_margin: float = 0.0,
+    cos_threshold: float = 0.5,
+    norm_floor: float = 0.0,
+    last_block_cos_threshold: Optional[float] = None,
     lookahead_veto: bool = False,
-    tail_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     log_fn: Callable[[str], None] = print,
 ) -> List[dict]:
-    """Sequentially fit and install ``CompensationBlock`` wrappers on ``model_sc``.
+    """Cross-seed QwT calibration — installs a per-block comp iff ``W`` is
+    reproducible across two disjoint calib batches.
 
-    For each block ``i``, using the *same* input as the SC path sees (important
-    — errors compound), this function:
+    For each block ``i``:
 
-    1. Computes the FP target ``Y_fp_i = blocks_fp[i](X_i)``.
-    2. Computes the SC output ``Y_sc_i = blocks_sc[i](X_i)`` — optionally
-       averaging ``avg_sc_draws`` independent realizations for a lower-variance
-       estimate of ``E[Y_sc | X]`` when the SC kernel is stochastic.
-    3. Solves ``(Y_fp - Y_sc) = X W + b`` via :func:`closed_form_ridge`.
-    4. Wraps ``blocks_sc[i]`` with :class:`CompensationBlock(W, b)` and
-       *propagates X through the compensated block* to form ``X_{i+1}``. This
-       sequential (Gauss–Seidel) update matches QwT's original scheme and is
-       crucial: each block is fit on the distribution it will actually see at
-       inference, after upstream compensation.
-
-    The function mutates ``blocks_sc_container[i]`` in place. It does not touch
-    ``blocks_fp``.
+      1. Fit ``W_A, b_A`` from batch A's ``(X_A, R_A)`` where
+         ``R_A = Y_fp(X_A) - Y_sc(X_A)``.
+      2. Fit ``W_B, b_B`` from batch B's ``(X_B, R_B)``.
+      3. Admit iff ``cos(flatten(W_A), flatten(W_B)) > cos_threshold`` AND
+         ``min(||W_A||, ||W_B||) > norm_floor``.
+      4. Install ``W̄ = (W_A + W_B)/2``, ``b̄ = (b_A + b_B)/2``.
+      5. Propagate both chains ``X_A, X_B`` through the installed wrapper so
+         block ``i+1`` sees the post-comp distribution (Gauss-Seidel).
 
     Args:
-        model_fp: FP reference model; used only to gather block-0 inputs via
-            a forward hook on its first block (``blocks_fp[0]``). You may pass
-            ``model_sc`` here instead if you want to use SC-path inputs.
-        model_sc: The SC-patched model we are compensating.
-        blocks_fp: List/sequence of FP blocks (same length as ``blocks_sc_container``).
-        blocks_sc_container: Container of SC blocks supporting item assignment
-            (typically ``model_sc.backbone.blocks`` or ``model_sc.blocks``).
-        calib_loader: yields ``(images, labels)`` or ``(images, _)``; only the
-            images are consumed.
-        device: torch device to run forwards on.
-        n_calib: number of calibration samples to gather.
-        ridge: L2 reg on the residual weight.
-        start_block: blocks with index ``< start_block`` get ``enabled=False``
-            (pass-through) after wrapping — useful if early blocks have noisy
-            fits that hurt downstream.
-        fwd_chunk: number of calib samples per block forward chunk.
-        avg_sc_draws: if > 1, average this many independent SC passes through
-            each block during calibration to reduce target variance.
-        log_fn: logging callback; defaults to ``print``.
+        model_fp: FP reference; used only to feed images for batch collection.
+        model_sc: SC-patched model; mutated in place (blocks wrapped).
+        blocks_fp, blocks_sc_container: parallel block lists.
+        calib_loader_a, calib_loader_b: two DataLoaders with disjoint image
+            samples (different seeds). Must each yield at least ``n_calib``
+            images. Their disjointness is what makes the cosine test work.
+        n_calib: samples to use per batch.
+        ridge: ℓ2 regularization on W in each LS fit.
+        start_block: indices < start_block are never admitted (pass-through).
+        fwd_chunk: forward batch size for block-level forwards.
+        cos_threshold: admission threshold τ. See module docstring for
+            tuning guidance; 0.5 is the recommended default.
+        norm_floor: additionally require min(||W_A||, ||W_B||) > this. 0.0
+            disables; useful when some blocks have ≈0 bias and cosine is
+            numerically noisy.
+        last_block_cos_threshold: stricter τ for the last block only.
+            Block 23 feeds the pre-head embedding directly, so demand
+            tighter agreement. 0.8 is the recommended default; ``None``
+            uses ``cos_threshold``.
+        lookahead_veto: one-step binary lookahead — veto apply if propagating
+            through block ``i+1`` shows 'skip' is closer to the FP chain than
+            'apply'. Uses batch A for the check. Conservative; rarely fires
+            under the cosine gate but is cheap insurance.
+        log_fn: logging callback.
 
     Returns:
-        A list of per-block diagnostic dicts with keys
-        ``{block, r2, enabled, rmse_before, rmse_after, dt_s}``.
+        List of per-block dicts with keys ``block, enabled, cos_ab,
+        cos_threshold_used, norm_a, norm_b, norm_floor, r2_a, r2_b,
+        rmse_before_a, rmse_before_b, rmse_after_a, rmse_after_b,
+        lookahead_decision, lookahead_err_apply, lookahead_err_skip, dt_s``.
     """
     assert len(blocks_fp) == len(blocks_sc_container), (
         f"fp blocks ({len(blocks_fp)}) vs sc blocks "
@@ -180,28 +279,31 @@ def calibrate_qwt(
     )
     n_blocks = len(blocks_fp)
 
-    # Collect block-0 inputs via a forward pre-hook on model_sc's first block.
-    first_block = blocks_sc_container[0]
-    captured: List[torch.Tensor] = []
+    def _collect_x0(loader, tag):
+        captured: List[torch.Tensor] = []
+        first_block = blocks_sc_container[0]
 
-    def hook(_m, args):
-        captured.append(args[0].detach().float().cpu())
+        def hook(_m, args):
+            captured.append(args[0].detach().float().cpu())
 
-    log_fn(f"[calib] collecting first-block inputs from model_sc")
-    handle = first_block.register_forward_pre_hook(hook)
-    seen = 0
-    try:
-        for batch in calib_loader:
-            imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
-            imgs = imgs.to(device, non_blocking=True)
-            model_sc(imgs)
-            seen += imgs.size(0)
-            if seen >= n_calib:
-                break
-    finally:
-        handle.remove()
-    X_cur = torch.cat(captured, dim=0)[:n_calib]
-    log_fn(f"[calib] X_0 shape={tuple(X_cur.shape)}  dtype={X_cur.dtype}")
+        log_fn(f"[calib] collecting block-0 inputs for batch {tag}")
+        handle = first_block.register_forward_pre_hook(hook)
+        seen = 0
+        try:
+            for batch in loader:
+                imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+                imgs = imgs.to(device, non_blocking=True)
+                model_sc(imgs)
+                seen += imgs.size(0)
+                if seen >= n_calib:
+                    break
+        finally:
+            handle.remove()
+        return torch.cat(captured, dim=0)[:n_calib]
+
+    X_a = _collect_x0(calib_loader_a, "A")
+    X_b = _collect_x0(calib_loader_b, "B")
+    log_fn(f"[calib] X_a {tuple(X_a.shape)}  X_b {tuple(X_b.shape)}")
 
     report: List[dict] = []
     for i in range(n_blocks):
@@ -209,171 +311,108 @@ def calibrate_qwt(
         blk_fp = blocks_fp[i]
         blk_sc = blocks_sc_container[i]
 
-        Y_fp = _forward_batched(blk_fp, X_cur, device, fwd_chunk)
-        Y_sc = None
-        for _ in range(avg_sc_draws):
-            yd = _forward_batched(blk_sc, X_cur, device, fwd_chunk)
-            Y_sc = yd if Y_sc is None else Y_sc + yd
-        Y_sc = Y_sc / avg_sc_draws
+        Y_fp_a = _forward_batched(blk_fp, X_a, device, fwd_chunk)
+        Y_sc_a = _forward_batched(blk_sc, X_a, device, fwd_chunk)
+        Y_fp_b = _forward_batched(blk_fp, X_b, device, fwd_chunk)
+        Y_sc_b = _forward_batched(blk_sc, X_b, device, fwd_chunk)
 
-        X_flat = X_cur.reshape(-1, X_cur.size(-1))
-        R_flat = (Y_fp - Y_sc).reshape(-1, Y_fp.size(-1))
-        Xg = X_flat.to(device)
-        Rg = R_flat.to(device)
-        W, b, r2 = closed_form_ridge(Xg, Rg, ridge=ridge)
+        Xa_flat = X_a.reshape(-1, X_a.size(-1)).to(device)
+        Ra_flat = (Y_fp_a - Y_sc_a).reshape(-1, Y_fp_a.size(-1)).to(device)
+        Xb_flat = X_b.reshape(-1, X_b.size(-1)).to(device)
+        Rb_flat = (Y_fp_b - Y_sc_b).reshape(-1, Y_fp_b.size(-1)).to(device)
 
-        raw_rmse = (Y_fp - Y_sc).pow(2).mean().sqrt().item()
-        after_rmse = (Rg - (Xg @ W + b)).pow(2).mean().sqrt().item()
+        W_a, b_a, r2_a = closed_form_ridge(Xa_flat, Ra_flat, ridge=ridge)
+        W_b, b_b, r2_b = closed_form_ridge(Xb_flat, Rb_flat, ridge=ridge)
 
-        # Noise-aware refit: when the comp itself runs in SC, account for its
-        # own measured SC noise δ(X; W, r_c) := c_sc(X; W) − (X W + b) inside
-        # the LS objective. Linearizing c_sc around the current (W, b) gives
-        # a one-shot residual subtraction; iterate K times for refinement.
-        refit_log = []
-        if comp_factory is not None and comp_refit_iters > 0:
-            for it in range(comp_refit_iters):
-                tmp_comp = comp_factory(W.detach().cpu(),
-                                         b.detach().cpu()).to(device)
-                with torch.no_grad():
-                    c_actual_chunks = []
-                    for s in range(0, Xg.size(0), fwd_chunk * 257):
-                        e = min(s + fwd_chunk * 257, Xg.size(0))
-                        c_actual_chunks.append(tmp_comp(Xg[s:e]))
-                    c_actual = torch.cat(c_actual_chunks, dim=0)
-                fp_pred = Xg @ W + b
-                delta = c_actual - fp_pred
-                Rg_corr = Rg - delta
-                W_new, b_new, r2_new = closed_form_ridge(Xg, Rg_corr,
-                                                          ridge=ridge)
-                after_rmse_new = (Rg - (Xg @ W_new + b_new) - delta).pow(2).mean().sqrt().item()
-                refit_log.append({
-                    "iter": it, "r2": r2_new,
-                    "after_rmse_with_delta": after_rmse_new,
-                    "delta_rmse": delta.pow(2).mean().sqrt().item(),
-                })
-                W, b = W_new, b_new
-                r2 = r2_new
-                after_rmse = after_rmse_new
-                del tmp_comp, c_actual, c_actual_chunks, fp_pred, delta
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        rmse_before_a = (Y_fp_a - Y_sc_a).pow(2).mean().sqrt().item()
+        rmse_before_b = (Y_fp_b - Y_sc_b).pow(2).mean().sqrt().item()
 
-        # Per-block r2 gate. `min_r2` (det-side alias) and `r2_threshold`
-        # (cls-side) are combined via max() so either caller can tighten the
-        # bar. Last block gets a stricter threshold when
-        # `last_block_r2_threshold` is provided — protects the pre-head
-        # embedding from borderline-r2 comps at the catastrophic late layer
-        # without sweeping all blocks under one conservative bar.
-        r2_thr_i = max(min_r2, r2_threshold)
-        if last_block_r2_threshold is not None and i == n_blocks - 1:
-            r2_thr_i = max(r2_thr_i, last_block_r2_threshold)
-        # rmse_margin: require raw_rmse / after_rmse > margin as an extra hurdle.
-        # Guards against knife-edge r² where LS explains variance but absolute
-        # RMSE reduction is modest — SC-comp's inference-time noise can then
-        # swamp the correction.
-        if rmse_margin > 0.0 and after_rmse > 0.0:
-            margin_ok = (raw_rmse / after_rmse) > rmse_margin
-        else:
-            margin_ok = True
-        enabled = ((i >= start_block) and (r2 > r2_thr_i)
-                   and margin_ok and (i < max_block_for_qwt))
+        # Cosine of flattened W matrices. Bias is excluded — a shared offset
+        # is always "reproducible" and would dilute the signal. Biases get
+        # averaged for install.
+        wa_vec = W_a.flatten()
+        wb_vec = W_b.flatten()
+        na = wa_vec.norm().item()
+        nb = wb_vec.norm().item()
+        cos_ab = (float((wa_vec @ wb_vec).item()) / (na * nb)) if (na > 0 and nb > 0) else 0.0
 
-        # 1-step binary lookahead: propagate block i's output (with vs without
-        # comp) through block_fp[i+1] and compare against the reference
-        # propagation of Y_fp_i. Veto `apply` when `skip` is closer to the FP
-        # chain. Only applies when there IS a next block; last-block
-        # protection is handled by `last_block_r2_threshold`.
+        W = (W_a + W_b) / 2.0
+        b = (b_a + b_b) / 2.0
+
+        rmse_after_a = (Ra_flat - (Xa_flat @ W + b)).pow(2).mean().sqrt().item()
+        rmse_after_b = (Rb_flat - (Xb_flat @ W + b)).pow(2).mean().sqrt().item()
+
+        thr_i = cos_threshold
+        if last_block_cos_threshold is not None and i == n_blocks - 1:
+            thr_i = max(thr_i, last_block_cos_threshold)
+
+        norm_ok = min(na, nb) > norm_floor
+        cos_ok = cos_ab > thr_i
+        enabled = (i >= start_block) and cos_ok and norm_ok
+
+        # One-step lookahead on batch A: does propagating through blk_fp[i+1]
+        # under 'apply' beat 'skip'? Veto apply if not. Cheap, rarely fires
+        # under the cosine gate but provides a principled tiebreaker for the
+        # borderline-cos regime.
         lookahead_err_apply = None
-        lookahead_err_skip  = None
-        lookahead_decision  = None
+        lookahead_err_skip = None
+        lookahead_decision = None
         if enabled and lookahead_veto and (i + 1 < n_blocks):
-            with torch.no_grad():
-                delta_gpu = (Xg @ W + b).reshape(Y_sc.shape).float()
-                Y_apply = Y_sc + delta_gpu.cpu()
-                blk_fp_next = blocks_fp[i + 1]
-                Y_ref_next   = _forward_batched(blk_fp_next, Y_fp,    device, fwd_chunk)
-                Y_apply_next = _forward_batched(blk_fp_next, Y_apply, device, fwd_chunk)
-                Y_skip_next  = _forward_batched(blk_fp_next, Y_sc,    device, fwd_chunk)
-                lookahead_err_apply = (Y_ref_next - Y_apply_next).pow(2).mean().item()
-                lookahead_err_skip  = (Y_ref_next - Y_skip_next ).pow(2).mean().item()
-                del delta_gpu, Y_apply, Y_ref_next, Y_apply_next, Y_skip_next
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            delta_gpu = (Xa_flat @ W + b).reshape(Y_sc_a.shape).float()
+            Y_apply = Y_sc_a + delta_gpu.cpu()
+            blk_fp_next = blocks_fp[i + 1]
+            Y_ref_next = _forward_batched(blk_fp_next, Y_fp_a, device, fwd_chunk)
+            Y_apply_next = _forward_batched(blk_fp_next, Y_apply, device, fwd_chunk)
+            Y_skip_next = _forward_batched(blk_fp_next, Y_sc_a, device, fwd_chunk)
+            lookahead_err_apply = (Y_ref_next - Y_apply_next).pow(2).mean().item()
+            lookahead_err_skip = (Y_ref_next - Y_skip_next).pow(2).mean().item()
+            del delta_gpu, Y_apply, Y_ref_next, Y_apply_next, Y_skip_next
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if lookahead_err_skip < lookahead_err_apply:
                 lookahead_decision = "veto"
-                log_fn(
-                    f"[lookahead] block {i}: VETO apply "
-                    f"(err_apply={lookahead_err_apply:.4e} > err_skip={lookahead_err_skip:.4e})"
-                )
                 enabled = False
+                log_fn(f"[lookahead] block {i}: VETO apply "
+                       f"(err_apply={lookahead_err_apply:.4e} > err_skip={lookahead_err_skip:.4e})")
             else:
                 lookahead_decision = "keep"
 
         W_cpu = W.detach().cpu()
         b_cpu = b.detach().cpu()
 
-        # Variant selection: try each candidate comp factory, measure
-        # ||R − c_sc(X; W)|| on calibration, keep the lowest-residual one.
-        # Records the chosen variant name per block (= 1 config bit per block
-        # in hardware when len(variants) == 2).
-        chosen_variant = None
-        variant_rmses = {}
-        comp_module = None
-
-        def _measure(mod):
-            mod = mod.to(device)
-            with torch.no_grad():
-                cs = []
-                for s in range(0, Xg.size(0), fwd_chunk * 257):
-                    e = min(s + fwd_chunk * 257, Xg.size(0))
-                    cs.append(mod(Xg[s:e]))
-                c_act = torch.cat(cs, dim=0)
-            return (Rg - c_act).pow(2).mean().sqrt().item()
-
-        if comp_factory_variants is not None and len(comp_factory_variants) > 0:
-            best = None
-            for vname, vfac in comp_factory_variants:
-                cand = vfac(W_cpu, b_cpu)
-                rmse_v = _measure(cand)
-                variant_rmses[vname] = rmse_v
-                if best is None or rmse_v < best[0]:
-                    best = (rmse_v, vname, cand)
-            _, chosen_variant, comp_module = best
-        elif comp_factory is not None:
-            comp_module = comp_factory(W_cpu, b_cpu)
-
         new_block = CompensationBlock(
             block=blk_sc, W=W_cpu, b=b_cpu,
-            r2=r2, enabled=enabled, comp_module=comp_module,
+            cos_ab=cos_ab, enabled=enabled,
         ).to(device)
         blocks_sc_container[i] = new_block
 
-        X_cur = _forward_batched(new_block, X_cur, device, fwd_chunk)
+        # Propagate both chains through the installed wrapper (Gauss-Seidel).
+        X_a = _forward_batched(new_block, X_a, device, fwd_chunk)
+        X_b = _forward_batched(new_block, X_b, device, fwd_chunk)
 
         dt = time.time() - t0
-        var_str = f"  var={chosen_variant}" if chosen_variant is not None else ""
         log_fn(
-            f"[calib] block {i:2d}  r2={r2:+.4f}  "
-            f"rmse {raw_rmse:.4e} -> {after_rmse:.4e}{var_str}  "
-            f"enabled={enabled}  ({dt:.1f}s)"
+            f"[calib] block {i:2d}  cos={cos_ab:+.4f}  "
+            f"||W_a||={na:.2e} ||W_b||={nb:.2e}  "
+            f"r2 {r2_a:+.3f}/{r2_b:+.3f}  "
+            f"rmse_before {rmse_before_a:.4e}/{rmse_before_b:.4e}  "
+            f"enabled={enabled}  ({dt:.1f}s)",
         )
         report.append({
-            "block": i, "r2": r2, "enabled": enabled,
-            "rmse_before": raw_rmse, "rmse_after": after_rmse,
-            "variant": chosen_variant,
-            "variant_rmses": variant_rmses,
-            "dt_s": dt,
-            "noise_aware_refit": refit_log,
-            "lookahead_decision": lookahead_decision,   # "keep" / "veto" / None
+            "block": i, "enabled": enabled,
+            "cos_ab": cos_ab,
+            "cos_threshold_used": thr_i,
+            "norm_a": na, "norm_b": nb, "norm_floor": norm_floor,
+            "r2_a": r2_a, "r2_b": r2_b,
+            "rmse_before_a": rmse_before_a, "rmse_before_b": rmse_before_b,
+            "rmse_after_a": rmse_after_a, "rmse_after_b": rmse_after_b,
+            "lookahead_decision": lookahead_decision,
             "lookahead_err_apply": lookahead_err_apply,
-            "lookahead_err_skip":  lookahead_err_skip,
-            "r2_threshold_used": r2_thr_i,   # differs from r2_threshold for last block
-            "rmse_margin": rmse_margin,
-            "margin_ok": margin_ok,
-            "rmse_ratio": (raw_rmse / after_rmse) if after_rmse > 0 else float("inf"),
+            "lookahead_err_skip": lookahead_err_skip,
+            "dt_s": dt,
         })
 
-        del Xg, Rg, W, b
+        del Xa_flat, Xb_flat, Ra_flat, Rb_flat, W_a, b_a, W_b, b_b, W, b
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
