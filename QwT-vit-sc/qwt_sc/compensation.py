@@ -83,7 +83,7 @@ that happens between calib (1024 images) and eval (50k).
 
 --------------------------------------------------------------------------
 N=1000 pilot evidence (5 configs, ``--cos_threshold 0.5``,
-``--last_block_cos_threshold 0.8``)
+``--last_block_cos_threshold 0.8``, **FP comp**)
 --------------------------------------------------------------------------
 
 Per-block cosines, identical bimodal structure across regimes:
@@ -95,8 +95,16 @@ Per-block cosines, identical bimodal structure across regimes:
     p7_mp           -0.01   -0.03   [+0.68, +0.90]   Δraw = +2.51
     avg192_mp       -0.03   +0.10   [+0.69, +0.93]   Δraw = +0.48
 
-    * p8_uniform -0.57 is within N=1000 variance (σ ≈ 1.1pt at top-1 ≈ 85%);
-      expected to resolve positive at N=50k.
+    * p8_uniform -0.57 is within N=1000 variance (σ ≈ 1.1pt at top-1 ≈ 85%).
+
+**Caveat.** This pilot ran with the FP comp kernel (bare ``nn.Linear``
+installed as the correction). The admission rule above is decoupled from
+the comp kernel choice, so the cosine signature is expected to be
+identical under SC comp — but Δtop-1 under SC comp has not been measured
+at this writing. Rerunning the pilot with ``--comp_mode sc --comp_sc_prec 8``
+is the prerequisite before quoting any production number, because the SC
+comp kernel introduces its own Sobol-sampling noise on top of the
+installed ``W̄``.
 
 Block 0 and block 1 are rejected on every regime (||W|| ≈ 10^3-10^4,
 cos ≈ 0). Blocks 2-23 are admitted on every regime. The separation between
@@ -225,6 +233,8 @@ def calibrate_qwt(
     norm_floor: float = 0.0,
     last_block_cos_threshold: Optional[float] = None,
     lookahead_veto: bool = False,
+    comp_factory: Optional[Callable[[torch.Tensor, torch.Tensor], nn.Module]] = None,
+    comp_factory_variants: Optional[List[tuple]] = None,
     log_fn: Callable[[str], None] = print,
 ) -> List[dict]:
     """Cross-seed QwT calibration — installs a per-block comp iff ``W`` is
@@ -380,9 +390,45 @@ def calibrate_qwt(
         W_cpu = W.detach().cpu()
         b_cpu = b.detach().cpu()
 
+        # Build the comp kernel. The cross-seed gate above decides *whether*
+        # to apply a correction; `comp_factory` / `comp_factory_variants`
+        # decide *how* the correction matmul runs (SCLinear, head-aligned,
+        # FP nn.Linear, …). When `comp_factory_variants` is given, each
+        # candidate kernel is measured against the calib residual and the
+        # one with lowest RMSE wins (per-block pick = O(log K) config bits
+        # in hardware). When only `comp_factory` is given it's a fast-path
+        # single kernel. When both are None, the CompensationBlock falls
+        # back to an FP nn.Linear — the historical debug path.
+        chosen_variant = None
+        variant_rmses = {}
+        comp_module = None
+
+        def _measure_variant(mod):
+            mod = mod.to(device)
+            with torch.no_grad():
+                cs = []
+                chunk_rows = max(fwd_chunk * 257, 1)
+                for s in range(0, Xa_flat.size(0), chunk_rows):
+                    e = min(s + chunk_rows, Xa_flat.size(0))
+                    cs.append(mod(Xa_flat[s:e]))
+                c_act = torch.cat(cs, dim=0)
+            return (Ra_flat - c_act).pow(2).mean().sqrt().item()
+
+        if comp_factory_variants is not None and len(comp_factory_variants) > 0:
+            best = None
+            for vname, vfac in comp_factory_variants:
+                cand = vfac(W_cpu, b_cpu)
+                rmse_v = _measure_variant(cand)
+                variant_rmses[vname] = rmse_v
+                if best is None or rmse_v < best[0]:
+                    best = (rmse_v, vname, cand)
+            _, chosen_variant, comp_module = best
+        elif comp_factory is not None:
+            comp_module = comp_factory(W_cpu, b_cpu)
+
         new_block = CompensationBlock(
             block=blk_sc, W=W_cpu, b=b_cpu,
-            cos_ab=cos_ab, enabled=enabled,
+            cos_ab=cos_ab, enabled=enabled, comp_module=comp_module,
         ).to(device)
         blocks_sc_container[i] = new_block
 
@@ -391,12 +437,13 @@ def calibrate_qwt(
         X_b = _forward_batched(new_block, X_b, device, fwd_chunk)
 
         dt = time.time() - t0
+        var_str = f"  comp={chosen_variant}" if chosen_variant is not None else ""
         log_fn(
             f"[calib] block {i:2d}  cos={cos_ab:+.4f}  "
             f"||W_a||={na:.2e} ||W_b||={nb:.2e}  "
             f"r2 {r2_a:+.3f}/{r2_b:+.3f}  "
             f"rmse_before {rmse_before_a:.4e}/{rmse_before_b:.4e}  "
-            f"enabled={enabled}  ({dt:.1f}s)",
+            f"enabled={enabled}{var_str}  ({dt:.1f}s)",
         )
         report.append({
             "block": i, "enabled": enabled,
@@ -409,6 +456,8 @@ def calibrate_qwt(
             "lookahead_decision": lookahead_decision,
             "lookahead_err_apply": lookahead_err_apply,
             "lookahead_err_skip": lookahead_err_skip,
+            "variant": chosen_variant,
+            "variant_rmses": variant_rmses,
             "dt_s": dt,
         })
 
