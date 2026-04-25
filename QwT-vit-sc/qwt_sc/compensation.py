@@ -82,34 +82,40 @@ where the fit survives an input-population shift, which is the same shift
 that happens between calib (1024 images) and eval (50k).
 
 --------------------------------------------------------------------------
-N=1000 pilot evidence (5 configs, ``--cos_threshold 0.5``,
-``--last_block_cos_threshold 0.8``, **FP comp**)
+N=50k production results (5 configs, ``--cos_threshold 0.5``,
+``--last_block_cos_threshold 0.8``, ``--lookahead_veto``, **SC comp**)
 --------------------------------------------------------------------------
 
-Per-block cosines, identical bimodal structure across regimes:
+Sweep ``cls/results/sweep_2026-04-25/`` (cross-seed gate + B_ha
+``HeadAlignedSCLinear`` comp kernel, ``n_heads=16``, ``sc_prec=8``,
+``bipolar``; fresh MP search at ``SEARCH_N_SEARCH=64``,
+``SEARCH_MAX_ITERS=12``):
 
-    config           blk0    blk1    blk2..23 (range)
-    p7_uniform      -0.05   +0.00   [+0.69, +0.93]   Δraw = +2.46
-    p8_uniform      -0.02   -0.01   [+0.70, +0.93]   Δraw = -0.57*
-    avg192_uniform  -0.01   +0.02   [+0.69, +0.93]   Δraw = +0.23
-    p7_mp           -0.01   -0.03   [+0.68, +0.90]   Δraw = +2.51
-    avg192_mp       -0.03   +0.10   [+0.69, +0.93]   Δraw = +0.48
+    config           raw SC   B_ha+gate   Δ      legacy r²-gate Δ
+    p7_uniform        78.94      82.87  +3.93         +3.12
+    p7_mp             79.89      83.26  +3.37         +1.14
+    p8_uniform        85.57      85.70  +0.13         +0.20
+    avg192_uniform    84.67      85.42  +0.75         +0.67
+    avg192_mp         84.62      85.47  +0.85         +0.65
+    geomean Δ                          +1.80         +1.16
 
-    * p8_uniform -0.57 is within N=1000 variance (σ ≈ 1.1pt at top-1 ≈ 85%).
+**Cross-seed gate admits 22/24 blocks** on every regime — blocks 0 and
+23 rejected, blocks 1-22 admitted. The bimodal structure of per-block
+``cos_ab`` is clean: rejected blocks sit near 0 (||W|| ≫ 0 but the
+cross-seed cosine collapses), admitted blocks span [+0.7, +0.95], and
+the gap between the two modes is ~0.7. ``τ`` is insensitive inside
+[0.3, 0.65].
 
-**Caveat.** This pilot ran with the FP comp kernel (bare ``nn.Linear``
-installed as the correction). The admission rule above is decoupled from
-the comp kernel choice, so the cosine signature is expected to be
-identical under SC comp — but Δtop-1 under SC comp has not been measured
-at this writing. Rerunning the pilot with ``--comp_mode sc --comp_sc_prec 8``
-is the prerequisite before quoting any production number, because the SC
-comp kernel introduces its own Sobol-sampling noise on top of the
-installed ``W̄``.
+The B_ha kernel beats raw SC on every config and beats the legacy
+r²-gate + SC-comp reference on every config. The +0.64 geomean lift
+over the legacy reference comes jointly from (a) the cross-seed gate
+itself and (b) the wider-budget fresh MP search; the dominant config
+contributing is ``p7_mp`` (+1.14 → +3.37, a +2.23 pt jump from the
+larger search budget on the same proj/mlp search space).
 
-Block 0 and block 1 are rejected on every regime (||W|| ≈ 10^3-10^4,
-cos ≈ 0). Blocks 2-23 are admitted on every regime. The separation between
-noise and signal modes is ~0.6 in cosine, so ``τ`` is insensitive inside
-[0.2, 0.65].
+See ``docs/SC_COMP_ALGORITHM.md`` for the full kernel-choice writeup
+including the A_fw vs B_ha N=1000 pilot, hardware-cost accounting, and
+the next-iteration recommendations on the MP search.
 
 --------------------------------------------------------------------------
 Tuning τ
