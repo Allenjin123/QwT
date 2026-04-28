@@ -17,12 +17,25 @@ EVA_DET = os.path.join(_THIS_DIR, "..", "eva_det")
 sys.path.insert(0, EVA_DET)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
-CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
-OUT = Path(__file__).parent / "results" / "fp100"
+CKPT = os.environ.get(
+    "EVA_CKPT",
+    "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth")
+N_EVAL = int(os.environ.get("N_EVAL", "100"))
+N_VIS = int(os.environ.get("N_VIS", "20"))
+# Square pad / ResizeShortestEdge override. 1280 = cfg default. Must be a
+# multiple of patch_size * window_size = 256. Mirrors the official
+# cascade_mask_rcnn_vitdet_eva_1536.py trick: keep ViT img_size at 1280 (so
+# pos embed shape stays as trained) and switch interp_type to "beit" for
+# on-the-fly pos embed interpolation at the new resolution.
+EVA_SIZE = int(os.environ.get("EVA_SIZE", "1280"))
+assert EVA_SIZE % 256 == 0, f"EVA_SIZE={EVA_SIZE} must be a multiple of 256"
+_size_tag = "" if EVA_SIZE == 1280 else f"_sz{EVA_SIZE}"
+# When the user explicitly asks for hard NMS via USE_SOFT_NMS=0, suffix the
+# output dir so it doesn't collide with soft-NMS runs at the same size/n_eval.
+_nms_tag = "" if os.environ.get("USE_SOFT_NMS", "1") not in ("0", "false", "False", "") else "_hardnms"
+OUT = Path(__file__).parent / "results" / f"fp{N_EVAL}{_size_tag}{_nms_tag}"
 OUT.mkdir(parents=True, exist_ok=True)
 (OUT / "vis").mkdir(exist_ok=True)
-N_EVAL = 100
-N_VIS = 20
 
 from detectron2.config import LazyConfig, instantiate
 from detectron2.checkpoint import DetectionCheckpointer
@@ -30,9 +43,19 @@ from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.utils.visualizer import Visualizer, ColorMode
 
-print("[1] Loading config")
+USE_SOFT_NMS = os.environ.get("USE_SOFT_NMS", "1") not in ("0", "false", "False", "")
+print(f"[1] Loading config (EVA_SIZE={EVA_SIZE} use_soft_nms={USE_SOFT_NMS})")
 cfg = LazyConfig.load(CFG_PATH)
 cfg.model.backbone.net.use_act_checkpoint = False
+if EVA_SIZE != 1280:
+    cfg.model.backbone.square_pad = EVA_SIZE
+    cfg.model.backbone.net.interp_type = "beit"
+    test_aug = cfg.dataloader.test.mapper.augmentations
+    assert len(test_aug) == 1, "expected exactly one test-time augmentation"
+    test_aug[0].short_edge_length = EVA_SIZE
+    test_aug[0].max_size = EVA_SIZE
+if USE_SOFT_NMS:
+    cfg.model.roi_heads.use_soft_nms = True
 
 print("[2] Building model")
 model = instantiate(cfg.model)

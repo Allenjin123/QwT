@@ -13,9 +13,79 @@ from detectron2.modeling.box_regression import Box2BoxTransform, _dense_box_regr
 from detectron2.structures import Boxes, Instances
 from detectron2.utils.events import get_event_storage
 try:
-    from mmcv.ops import soft_nms
+    from mmcv.ops import soft_nms as _mmcv_soft_nms
 except ImportError:
-    soft_nms = None
+    _mmcv_soft_nms = None
+
+
+def _soft_nms_torch(boxes, scores, iou_threshold=0.3, sigma=0.5,
+                    min_score=1e-3, method='linear'):
+    """Pure-PyTorch fallback for mmcv.ops.soft_nms (Bodla et al., ICCV'17).
+
+    Same signature: returns ``(dets, keep)`` where ``dets[:, :4]`` are the
+    kept boxes (in input order), ``dets[:, -1]`` are their decayed scores,
+    and ``keep`` is a long tensor of indices into the input.
+
+    Algorithm: repeatedly pick the highest-scoring remaining box; for each
+    other box, decay its score based on IoU with the picked box; drop boxes
+    whose decayed score falls below ``min_score``.
+    """
+    device, dtype = boxes.device, boxes.dtype
+    N = boxes.size(0)
+    if N == 0:
+        return (torch.empty((0, 5), dtype=dtype, device=device),
+                torch.empty((0,), dtype=torch.long, device=device))
+
+    bx = boxes.clone()
+    sc = scores.clone()
+    idx = torch.arange(N, device=device)
+
+    kept_idx, kept_sc = [], []
+
+    while sc.numel() > 0:
+        m = int(sc.argmax())
+        kept_idx.append(int(idx[m]))
+        kept_sc.append(float(sc[m]))
+
+        max_box = bx[m:m + 1]
+        keep_pos = torch.arange(sc.size(0), device=device) != m
+        bx = bx[keep_pos]
+        sc = sc[keep_pos]
+        idx = idx[keep_pos]
+        if sc.numel() == 0:
+            break
+
+        # IoU(max_box, rest)
+        a1 = (max_box[:, 2] - max_box[:, 0]) * (max_box[:, 3] - max_box[:, 1])
+        a2 = (bx[:, 2] - bx[:, 0]) * (bx[:, 3] - bx[:, 1])
+        lt = torch.max(max_box[:, :2], bx[:, :2])
+        rb = torch.min(max_box[:, 2:], bx[:, 2:])
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[:, 0] * wh[:, 1]
+        ious = inter / (a1 + a2 - inter).clamp(min=1e-7)
+
+        if method == 'linear':
+            decay = torch.where(ious > iou_threshold, 1.0 - ious,
+                                torch.ones_like(ious))
+        elif method == 'gaussian':
+            decay = torch.exp(-(ious * ious) / sigma)
+        else:  # 'standard' = hard NMS
+            decay = (ious <= iou_threshold).to(sc.dtype)
+
+        sc = sc * decay
+        keep_mask = sc >= min_score
+        bx = bx[keep_mask]
+        sc = sc[keep_mask]
+        idx = idx[keep_mask]
+
+    keep = torch.as_tensor(kept_idx, dtype=torch.long, device=device)
+    out_sc = torch.as_tensor(kept_sc, dtype=dtype, device=device)
+    dets = torch.cat([boxes[keep], out_sc.unsqueeze(1)], dim=1)
+    return dets, keep
+
+
+# Prefer mmcv (CUDA, faster) when available; otherwise use the torch fallback.
+soft_nms = _mmcv_soft_nms if _mmcv_soft_nms is not None else _soft_nms_torch
 
 __all__ = ["fast_rcnn_inference", "FastRCNNOutputLayers"]
 
@@ -179,8 +249,6 @@ def fast_rcnn_inference_single_image(
 
     # optionally use soft-nms here
     if use_soft_nms:
-        if soft_nms is None:
-            raise RuntimeError("use_soft_nms=True but mmcv.ops.soft_nms not importable. Install mmcv or set use_soft_nms=False.")
         try:
             max_coordinate = boxes.max()
         except:

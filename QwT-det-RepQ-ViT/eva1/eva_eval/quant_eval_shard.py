@@ -18,7 +18,9 @@ sys.path.insert(0, EVA_DET)
 sys.path.insert(0, _THIS_DIR)
 
 CFG_PATH = f"{EVA_DET}/projects/ViTDet/configs/COCO/cascade_mask_rcnn_vitdet_eva.py"
-CKPT = "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth"
+CKPT = os.environ.get(
+    "EVA_CKPT",
+    "/scratch/nbleier_owned_root/nbleier_owned1/shared_data/pretrained/eva_coco_det.pth")
 
 p = argparse.ArgumentParser()
 p.add_argument("--w-bits",  type=int, default=8)
@@ -53,8 +55,27 @@ from quant import (quant_model_eva, set_quant_state, scale_reparam_eva,
                    collapse_beit_like_qkv_bias, generate_compensation_model_eva)
 from quant.quant_modules import QuantLinear, QuantConv2d, QuantMatMul
 
+# Square pad / ResizeShortestEdge override. 1280 = cfg default. Must be a
+# multiple of patch_size * window_size = 256. Mirrors cascade_mask_rcnn_vitdet_eva_1536.py:
+# keep ViT img_size at 1280 and switch interp_type to "beit" so the trained
+# pos embed gets bicubic-interpolated to the new resolution per forward.
+EVA_SIZE = int(os.environ.get("EVA_SIZE", "1280"))
+assert EVA_SIZE % 256 == 0, f"EVA_SIZE={EVA_SIZE} must be a multiple of 256"
+USE_SOFT_NMS = os.environ.get("USE_SOFT_NMS", "1") not in ("0", "false", "False", "")
+
 cfg = LazyConfig.load(CFG_PATH)
 cfg.model.backbone.net.use_act_checkpoint = False
+if EVA_SIZE != 1280:
+    cfg.model.backbone.square_pad = EVA_SIZE
+    cfg.model.backbone.net.interp_type = "beit"
+    test_aug = cfg.dataloader.test.mapper.augmentations
+    assert len(test_aug) == 1, "expected exactly one test-time augmentation"
+    test_aug[0].short_edge_length = EVA_SIZE
+    test_aug[0].max_size = EVA_SIZE
+    print(f"[shard {args.shard_idx}] EVA_SIZE={EVA_SIZE} (square_pad+ResizeShortestEdge override; interp_type=beit)")
+if USE_SOFT_NMS:
+    cfg.model.roi_heads.use_soft_nms = True
+    print(f"[shard {args.shard_idx}] use_soft_nms=True (linear, iou_thresh=0.3)")
 model = instantiate(cfg.model).eval().cuda()
 DetectionCheckpointer(model).load(CKPT)
 
