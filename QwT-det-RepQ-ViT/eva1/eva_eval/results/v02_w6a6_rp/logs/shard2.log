@@ -1,6 +1,0 @@
-/home/yjrcs/SC_V/QwT/QwT-det-RepQ-ViT/eva_det/detectron2/config/lazy.py:154: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
-  return old_import(name, globals, locals, fromlist=fromlist, level=level)
-[shard 2/4] slice [50:75]  W6/A6  -> pred_shard2.pth
-[shard 2] collapsed beit_like qkv_bias on 40 attentions
-[shard 2] QuantLinear=160 QuantConv2d=1 QuantMatMul=80
-[shard 2] calibrating on 5 images...
