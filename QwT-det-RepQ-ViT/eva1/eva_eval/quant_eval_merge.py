@@ -38,11 +38,19 @@ print(f"[merge] loading {len(shard_files)} shards")
 predictions, seen_ids, meta = [], set(), {}
 for f in shard_files:
     d = torch.load(f, map_location="cpu", weights_only=False)
-    predictions.extend(d["predictions"])
-    meta = {k: d[k] for k in ("w_bits", "a_bits", "n_shards")}
+    fmt = d.get("format", "raw_v0")
     for pr in d["predictions"]:
-        seen_ids.add(int(pr["image_id"]))
-print(f"[merge] {len(predictions)} predictions, {len(seen_ids)} unique image_ids")
+        iid = int(pr["image_id"])
+        seen_ids.add(iid)
+        if fmt == "coco_v1":
+            # New format: shard already RLE-encoded each image's predictions.
+            predictions.extend(pr["coco"])
+        else:
+            # Legacy format: raw Instances object, convert here.
+            predictions.extend(instances_to_coco_json(pr["instances"], iid))
+    meta = {k: d[k] for k in ("w_bits", "a_bits", "n_shards")}
+print(f"[merge] {len(predictions)} predictions, {len(seen_ids)} unique image_ids "
+      f"(format={fmt})")
 
 # Build evaluator; restrict coco api to images we predicted on
 evaluator = COCOEvaluator(orig_name, tasks=("bbox", "segm"), distributed=False,
@@ -53,14 +61,17 @@ coco.anns      = {k: v for k, v in coco.anns.items() if v["image_id"] in seen_id
 coco.imgToAnns = {k: v for k, v in coco.imgToAnns.items() if k in seen_ids}
 coco.catToImgs = {c: [i for i in imgs if i in seen_ids] for c, imgs in coco.catToImgs.items()}
 
-# COCOEvaluator._predictions expects list of dicts with "instances" as raw Instances object
-# and converts to COCO format in _eval_predictions via instances_to_coco_json
+# `predictions` is already a flat list of COCO-format dicts (one per detection).
+# Group them back by image so they match the shape COCOEvaluator._eval_predictions
+# expects: a list of {"image_id": ..., "instances": [coco_det, coco_det, ...]}.
+# Seed by_image from seen_ids so images with zero detections still appear (matches
+# the legacy behaviour where every predicted image had an entry, possibly empty).
 evaluator.reset()
-# Convert raw Instances -> COCO dicts (what COCOEvaluator.process() would have done)
-coco_preds = [{"image_id": int(pr["image_id"]),
-               "instances": instances_to_coco_json(pr["instances"], int(pr["image_id"]))}
-              for pr in predictions]
-evaluator._predictions = coco_preds
+by_image = {iid: [] for iid in seen_ids}
+for det in predictions:
+    by_image[int(det["image_id"])].append(det)
+evaluator._predictions = [{"image_id": iid, "instances": dets}
+                          for iid, dets in by_image.items()]
 results = evaluator.evaluate()
 
 print("[merge] Results:")
@@ -88,7 +99,9 @@ if fp_file.exists():
 metadata = MetadataCatalog.get(orig_name)
 class_names = metadata.thing_classes
 id2item = {int(it["image_id"]): it for it in all_items}
-id2pred = {int(pr["image_id"]): pr["instances"] for pr in predictions}
+# After the COCO-format refactor, predictions are flat per-detection dicts,
+# not per-image Instances. Group them per-image for vis.
+id2dets = {iid: by_image[iid] for iid in seen_ids}
 
 def draw_gt(im, item):
     out = im.copy()
@@ -99,33 +112,35 @@ def draw_gt(im, item):
         cv2.putText(out, name, (x, max(y-4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
     return out
 
-def draw_pred(im, inst, thresh=0.5):
+def draw_pred(im, dets, thresh=0.5):
+    """``dets`` is a list of COCO-format detection dicts for one image."""
+    from pycocotools import mask as mask_util
     out = im.copy()
-    scores = inst.scores.numpy(); boxes = inst.pred_boxes.tensor.numpy(); classes = inst.pred_classes.numpy()
-    has_mask = inst.has("pred_masks"); masks = inst.pred_masks.numpy() if has_mask else None
-    for i in range(len(inst)):
-        if scores[i] < thresh: continue
-        x1,y1,x2,y2 = [int(v) for v in boxes[i]]
-        cls = classes[i]; name = class_names[cls] if cls < len(class_names) else str(cls)
-        if has_mask:
-            m = masks[i].astype(np.uint8); colored = np.zeros_like(out); colored[m>0] = (0, 0, 255)
+    for d in dets:
+        if d["score"] < thresh: continue
+        x, y, w, h = [int(v) for v in d["bbox"]]    # COCO bbox is xywh
+        cls = d["category_id"]
+        name = class_names[cls] if cls < len(class_names) else str(cls)
+        if "segmentation" in d:
+            m = mask_util.decode(d["segmentation"])
+            colored = np.zeros_like(out); colored[m > 0] = (0, 0, 255)
             out = cv2.addWeighted(out, 1.0, colored, 0.4, 0)
-        cv2.rectangle(out, (x1,y1), (x2,y2), (0, 165, 255), 2)
-        cv2.putText(out, f"{name} {scores[i]:.2f}", (x1, max(y1-4, 10)),
+        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 165, 255), 2)
+        cv2.putText(out, f"{name} {d['score']:.2f}", (x, max(y-4, 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
     return out
 
 sorted_ids = sorted(seen_ids)[: args.n_vis]
 for iid in sorted_ids:
-    item = id2item[iid]; inst = id2pred[iid]
+    item = id2item[iid]; dets = id2dets[iid]
     im = cv2.imread(item["file_name"])
-    gt = draw_gt(im, item); pr = draw_pred(im, inst, thresh=0.5)
+    gt = draw_gt(im, item); pr = draw_pred(im, dets, thresh=0.5)
     h = max(gt.shape[0], pr.shape[0])
     def pad(x): return cv2.copyMakeBorder(x, 0, h-x.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(0,0,0))
     panel = np.concatenate([pad(gt), pad(pr)], axis=1)
     cv2.putText(panel, "GT (green)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-    n_kept = int((inst.scores >= 0.5).sum())
-    cv2.putText(panel, f"W{meta['w_bits']}A{meta['a_bits']}  >=0.5: {n_kept}/{len(inst)}",
+    n_kept = sum(1 for d in dets if d["score"] >= 0.5)
+    cv2.putText(panel, f"W{meta['w_bits']}A{meta['a_bits']}  >=0.5: {n_kept}/{len(dets)}",
                 (gt.shape[1]+10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,165,255), 2)
     cv2.imwrite(str(OUT/"vis"/f"{iid:012d}.jpg"), panel)
 print(f"[merge] {len(sorted_ids)} vis saved to {OUT/'vis'}/")

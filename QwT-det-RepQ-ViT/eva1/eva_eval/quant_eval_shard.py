@@ -34,6 +34,10 @@ p.add_argument("--reparam", action="store_true", help="RepQ-ViT scale reparam af
 p.add_argument("--qwt", action="store_true", help="install QwT compensation after calib")
 p.add_argument("--qwt-n-samples", type=int, default=32)
 p.add_argument("--qwt-start-block", type=int, default=0)
+p.add_argument("--no-quant", action="store_true",
+               help="Skip quant model wrapping, calibration, reparam and QwT. "
+                    "Useful for an FP baseline that exercises the same shard "
+                    "infrastructure as the quant runs.")
 args = p.parse_args()
 
 W, A = args.w_bits, args.a_bits
@@ -51,6 +55,7 @@ from detectron2.config import LazyConfig, instantiate
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.data import DatasetCatalog, MetadataCatalog
 
+from detectron2.evaluation.coco_evaluation import instances_to_coco_json
 from quant import (quant_model_eva, set_quant_state, scale_reparam_eva,
                    collapse_beit_like_qkv_bias, generate_compensation_model_eva)
 from quant.quant_modules import QuantLinear, QuantConv2d, QuantMatMul
@@ -79,18 +84,21 @@ if USE_SOFT_NMS:
 model = instantiate(cfg.model).eval().cuda()
 DetectionCheckpointer(model).load(CKPT)
 
-if args.reparam:
-    n_collapsed = collapse_beit_like_qkv_bias(model.backbone.net)
-    print(f"[shard {args.shard_idx}] collapsed beit_like qkv_bias on {n_collapsed} attentions")
+if args.no_quant:
+    print(f"[shard {args.shard_idx}] --no-quant: skipping quant wrap / calib / reparam / qwt (FP baseline through shard infra)")
+else:
+    if args.reparam:
+        n_collapsed = collapse_beit_like_qkv_bias(model.backbone.net)
+        print(f"[shard {args.shard_idx}] collapsed beit_like qkv_bias on {n_collapsed} attentions")
 
-quant_model_eva(
-    model.backbone,
-    input_quant_params=dict(n_bits=A),
-    weight_quant_params=dict(n_bits=W, channel_wise=True),
-)
-print(f"[shard {args.shard_idx}] QuantLinear={sum(1 for m in model.modules() if isinstance(m, QuantLinear))} "
-      f"QuantConv2d={sum(1 for m in model.modules() if isinstance(m, QuantConv2d))} "
-      f"QuantMatMul={sum(1 for m in model.modules() if isinstance(m, QuantMatMul))}")
+    quant_model_eva(
+        model.backbone,
+        input_quant_params=dict(n_bits=A),
+        weight_quant_params=dict(n_bits=W, channel_wise=True),
+    )
+    print(f"[shard {args.shard_idx}] QuantLinear={sum(1 for m in model.modules() if isinstance(m, QuantLinear))} "
+          f"QuantConv2d={sum(1 for m in model.modules() if isinstance(m, QuantConv2d))} "
+          f"QuantMatMul={sum(1 for m in model.modules() if isinstance(m, QuantMatMul))}")
 
 orig_name = cfg.dataloader.test.dataset.names
 all_items = DatasetCatalog.get(orig_name)
@@ -103,16 +111,17 @@ if sub_name not in DatasetCatalog.list():
 cfg.dataloader.test.dataset.names = sub_name
 test_loader = instantiate(cfg.dataloader.test)
 
-set_quant_state(model, input_quant=True, weight_quant=True)
-print(f"[shard {args.shard_idx}] calibrating on {args.n_calib} images...")
-t0 = time.time()
-with torch.no_grad():
-    it = iter(test_loader)
-    for _ in range(args.n_calib):
-        model(next(it))
-print(f"[shard {args.shard_idx}] calib {time.time()-t0:.1f}s")
+if not args.no_quant:
+    set_quant_state(model, input_quant=True, weight_quant=True)
+    print(f"[shard {args.shard_idx}] calibrating on {args.n_calib} images...")
+    t0 = time.time()
+    with torch.no_grad():
+        it = iter(test_loader)
+        for _ in range(args.n_calib):
+            model(next(it))
+    print(f"[shard {args.shard_idx}] calib {time.time()-t0:.1f}s")
 
-if args.reparam:
+if args.reparam and not args.no_quant:
     n_rp = scale_reparam_eva(model.backbone.net)
     print(f"[shard {args.shard_idx}] scale reparam on {n_rp} (LN, Linear) pairs")
     # weight quantizers were reset; one more forward to re-init them
@@ -124,7 +133,7 @@ if args.reparam:
             model(next(it))
     print(f"[shard {args.shard_idx}] re-calib (post-reparam) {time.time()-t0:.1f}s")
 
-if args.qwt:
+if args.qwt and not args.no_quant:
     # Rebuild loader to get a fresh iterator for compensation calibration
     qwt_loader = instantiate(cfg.dataloader.test)
     t0 = time.time()
@@ -141,6 +150,10 @@ if args.qwt:
     set_quant_state(model, input_quant=True, weight_quant=True)
 
 test_loader = instantiate(cfg.dataloader.test)
+# Per-image predictions, already RLE-encoded into COCO format. Storing the
+# raw Instances object instead would balloon the shard file to tens of GB
+# because pred_masks are dense bool tensors at H×W; the COCO json is ~30 MB
+# for 5000 images.
 predictions = []
 t0 = time.time()
 with torch.no_grad():
@@ -149,11 +162,18 @@ with torch.no_grad():
         if idx >= hi: break
         out = model(batch)
         for inp, o in zip(batch, out):
-            predictions.append({"image_id": inp["image_id"], "instances": o["instances"].to("cpu")})
+            iid = int(inp["image_id"])
+            inst = o["instances"].to("cpu")
+            predictions.append({
+                "image_id": iid,
+                "coco": instances_to_coco_json(inst, iid),
+                "n_inst": int(len(inst)),
+            })
 dt = time.time() - t0
 print(f"[shard {args.shard_idx}] inference on {hi-lo} imgs: {dt:.1f}s ({dt/max(hi-lo,1):.2f}s/img)")
 
 torch.save({"predictions": predictions, "shard_idx": args.shard_idx,
             "n_shards": args.n_shards, "lo": lo, "hi": hi,
-            "w_bits": W, "a_bits": A}, pred_file)
+            "w_bits": W, "a_bits": A,
+            "format": "coco_v1"}, pred_file)
 print(f"[shard {args.shard_idx}] saved {pred_file}")
