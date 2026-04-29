@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pool-based runner for 7 EVA eval tasks:
-#   1) fp100                      FP baseline
+#   1) fp${N}                     FP baseline (via quant_eval_shard --no-quant)
 #   2) v01_w6a6_rp                int6 + reparam
 #   3) v02_w7a7_rp                int7 + reparam
 #   4) v03_w8a8_rp                int8 + reparam
@@ -8,16 +8,27 @@
 #   6) v05_w7a7_rp_qwt            int7 + reparam + QwT
 #   7) v06_w8a8_rp_qwt            int8 + reparam + QwT
 #
-# One GPU per task. Pass the physical GPU IDs to use as positional args; the
-# pool size equals the number of GPUs you list.
+# Two scheduling knobs:
+#   - GPUs:           positional args  (e.g. ./run_pool.sh 0 1 2 3 4 5 6 7)
+#   - SHARDS_PER_TASK env             (default 1)
 #
-# Usage:
-#   ./run_pool.sh 3 4 5            # uses GPUs 3,4,5 -> 3-way concurrent
-#   ./run_pool.sh 0                # serial on GPU 0
+# How they combine:
+#   #GPUs / SHARDS_PER_TASK  =  number of tasks running concurrently.
+#   Each task uses SHARDS_PER_TASK GPUs (data-parallel sharded), the rest of
+#   the tasks queue up. When a task's group of GPUs frees up, the next pending
+#   task takes that group.
 #
-# Per-task log: results/logs/pool_<tag>.log
-# Status log:   results/logs/pool_status.log
-# Resume:       tasks with results/<tag>/metrics.json are skipped.
+# Examples:
+#   ./run_pool.sh 0 1 2 3 4 5 6 7              # 8 tasks parallel × 1 GPU
+#   SHARDS_PER_TASK=2 ./run_pool.sh 0 1 2 3 4 5 6 7   # 4 tasks parallel × 2 GPUs
+#   SHARDS_PER_TASK=8 ./run_pool.sh 0 1 2 3 4 5 6 7   # 1 task at a time × 8 GPUs
+#   ./run_pool.sh 0                            # 1 task × 1 GPU (serial)
+#
+# Per-task log:    results/logs/pool_<tag>.log
+# Per-shard log:   results/<tag>/logs/shard<i>.log   (multi-shard tasks)
+# Status log:      results/logs/pool_status_<run_key>.log
+# Resume:          tasks with results/<tag>/metrics.json are skipped.
+#                  shard.py uses --resume to skip already-evaluated images.
 set -uo pipefail
 
 if [ $# -lt 1 ]; then
@@ -51,8 +62,6 @@ N_EVAL="${N_EVAL:-5000}"
 export N_EVAL
 
 # Image size override (square_pad + ResizeShortestEdge). 1280 = cfg default.
-# Must be a multiple of 256. Setting non-default also enables interp_type="beit"
-# inside the eval scripts (mirrors cascade_mask_rcnn_vitdet_eva_1536.py).
 EVA_SIZE="${EVA_SIZE:-1280}"
 export EVA_SIZE
 if [ $((EVA_SIZE % 256)) -ne 0 ]; then
@@ -64,48 +73,106 @@ if [ "$EVA_SIZE" != "1280" ]; then
   SZ_SUFFIX="_sz${EVA_SIZE}"
 fi
 
-# Per-run status log (namespaced so concurrent pools at different sizes don't
-# stomp each other).
-RUN_KEY="sz${EVA_SIZE}_n${N_EVAL}"
-STATUS="results/logs/pool_status_${RUN_KEY}.log"
-echo "=== pool started $(date) gpus=${GPUS[*]} run_key=${RUN_KEY} ===" > "$STATUS"
+# Shard-per-task knob: how many GPUs each task uses (data-parallel shards).
+SHARDS_PER_TASK="${SHARDS_PER_TASK:-1}"
+if [ "$SHARDS_PER_TASK" -lt 1 ]; then
+  echo "[pool] SHARDS_PER_TASK=$SHARDS_PER_TASK must be >= 1" >&2
+  exit 1
+fi
+if [ ${#GPUS[@]} -lt "$SHARDS_PER_TASK" ]; then
+  echo "[pool] need at least SHARDS_PER_TASK=$SHARDS_PER_TASK GPUs, got ${#GPUS[@]}" >&2
+  exit 1
+fi
+N_GPU_GROUPS=$((${#GPUS[@]} / SHARDS_PER_TASK))
+LEFTOVER=$((${#GPUS[@]} % SHARDS_PER_TASK))
 
-# tag | kind(fp|quant) | extra args to quant_eval_shard.py
+# Build GPU groups: each group is a comma-separated list of physical GPU IDs.
+declare -a GPU_GROUPS
+for ((g=0; g<N_GPU_GROUPS; g++)); do
+  start=$((g * SHARDS_PER_TASK))
+  group=""
+  for ((i=0; i<SHARDS_PER_TASK; i++)); do
+    [ -n "$group" ] && group="${group},"
+    group="${group}${GPUS[$((start + i))]}"
+  done
+  GPU_GROUPS+=("$group")
+done
+
+# Per-run status log.
+RUN_KEY="sz${EVA_SIZE}_n${N_EVAL}_spt${SHARDS_PER_TASK}"
+STATUS="results/logs/pool_status_${RUN_KEY}.log"
+{
+  echo "=== pool started $(date) ==="
+  echo "  gpus=${GPUS[*]}  groups=${GPU_GROUPS[*]}"
+  echo "  shards_per_task=${SHARDS_PER_TASK}  concurrent_tasks=${N_GPU_GROUPS}"
+  if [ "$LEFTOVER" -gt 0 ]; then
+    echo "  WARNING: ${LEFTOVER} GPU(s) will be idle (not divisible by SHARDS_PER_TASK)"
+  fi
+  echo "  n_eval=${N_EVAL}  eva_size=${EVA_SIZE}  run_key=${RUN_KEY}"
+} > "$STATUS"
+cat "$STATUS"
+
+# Task table. Note: FP now also goes through quant_eval_shard.py via --no-quant,
+# so it can shard across multiple GPUs identically to the quant tasks.
 TASKS=(
-  "fp${N_EVAL}${SZ_SUFFIX}|fp|"
-  "v01_w6a6_rp_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 6 --a-bits 6 --reparam"
-  "v02_w7a7_rp_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 7 --a-bits 7 --reparam"
-  "v03_w8a8_rp_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 8 --a-bits 8 --reparam"
-  "v04_w6a6_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 6 --a-bits 6 --reparam --qwt --qwt-n-samples 128"
-  "v05_w7a7_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 7 --a-bits 7 --reparam --qwt --qwt-n-samples 128"
-  "v06_w8a8_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|quant|--w-bits 8 --a-bits 8 --reparam --qwt --qwt-n-samples 128"
+  "fp${N_EVAL}${SZ_SUFFIX}|--no-quant"
+  "v01_w6a6_rp_n${N_EVAL}${SZ_SUFFIX}|--w-bits 6 --a-bits 6 --reparam"
+  "v02_w7a7_rp_n${N_EVAL}${SZ_SUFFIX}|--w-bits 7 --a-bits 7 --reparam"
+  "v03_w8a8_rp_n${N_EVAL}${SZ_SUFFIX}|--w-bits 8 --a-bits 8 --reparam"
+  "v04_w6a6_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|--w-bits 6 --a-bits 6 --reparam --qwt --qwt-n-samples 128"
+  "v05_w7a7_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|--w-bits 7 --a-bits 7 --reparam --qwt --qwt-n-samples 128"
+  "v06_w8a8_rp_qwt_n${N_EVAL}${SZ_SUFFIX}|--w-bits 8 --a-bits 8 --reparam --qwt --qwt-n-samples 128"
 )
 
+
+# Run a single task on a GPU group. Launches SHARDS_PER_TASK shard processes
+# in parallel (one per GPU in the group), waits for all of them, then runs
+# merge. Caller already redirected stdout/stderr to the per-task log file.
 run_task() {
-  local gpu="$1"; local tag="$2"; local kind="$3"; local extra="$4"
+  local group_gpus="$1"   # e.g. "0,1,2,3"
+  local tag="$2"
+  local extra="$3"
   local log="results/logs/pool_${tag}.log"
   local t0=$SECONDS
+
+  IFS=',' read -ra gpus <<< "$group_gpus"
+  local n_shards=${#gpus[@]}
+
   (
     set -e
-    if [ "$kind" = "fp" ]; then
-      CUDA_VISIBLE_DEVICES="$gpu" python -u fp_eval100.py
-    else
-      rm -f "results/${tag}"/pred_shard*.pth 2>/dev/null || true
-      mkdir -p "results/${tag}/logs"
+    mkdir -p "results/${tag}/logs"
+    pids=()
+    for sid in $(seq 0 $((n_shards - 1))); do
+      local gpu="${gpus[$sid]}"
       CUDA_VISIBLE_DEVICES="$gpu" python -u quant_eval_shard.py \
-          --shard-idx 0 --n-shards 1 --n-eval "$N_EVAL" --tag "$tag" $extra
-      CUDA_VISIBLE_DEVICES="$gpu" python -u quant_eval_merge.py --tag "$tag"
+          --shard_id "$sid" --num_shards "$n_shards" \
+          --n_eval "$N_EVAL" --tag "$tag" --resume $extra \
+          > "results/${tag}/logs/shard${sid}.log" 2>&1 &
+      pids+=($!)
+    done
+    # Wait for all shards; if any fails, propagate non-zero.
+    fail=0
+    for pid in "${pids[@]}"; do
+      if ! wait "$pid"; then fail=1; fi
+    done
+    if [ $fail -ne 0 ]; then
+      echo "[run_task] one or more shards failed; tails:"
+      tail -n 15 "results/${tag}/logs/shard"*.log
+      exit 1
     fi
+    # Merge once all shards finished.
+    CUDA_VISIBLE_DEVICES="${gpus[0]}" python -u quant_eval_merge.py \
+        --tag "$tag" --rm-shards
   ) > "$log" 2>&1
   local rc=$?
   local dt=$((SECONDS - t0))
   {
     if [ $rc -ne 0 ]; then
-      echo "[pool] !!! $tag FAILED on GPU $gpu (${dt}s) — see $log"
+      echo "[pool] !!! $tag FAILED on GPUs $group_gpus (${dt}s) — see $log"
       tail -20 "$log"
     else
       grep -E "\[bbox\] AP|\[segm\] AP|ΔAP" "$log" | head -4 || true
-      echo "[pool] <<< $tag done on GPU $gpu in ${dt}s"
+      echo "[pool] <<< $tag done on GPUs $group_gpus in ${dt}s"
     fi
   } | tee -a "$STATUS"
   return $rc
@@ -113,8 +180,6 @@ run_task() {
 
 # Optional task subset filter. Comma-separated list of task-id prefixes
 # matched against the leading "fp" / "vNN" of each tag.
-#   TASKS_INCLUDE=fp,v01,v02       -> only those four
-#   (unset / empty)                -> all 7 (default)
 TASKS_INCLUDE="${TASKS_INCLUDE:-}"
 declare -A INCLUDE_SET
 if [ -n "$TASKS_INCLUDE" ]; then
@@ -126,10 +191,7 @@ fi
 # TASKS_INCLUDE (when set).
 PENDING=()
 for entry in "${TASKS[@]}"; do
-  IFS='|' read -r tag kind extra <<< "$entry"
-  # Derive a stable task id from the tag for filter matching:
-  #   fp5000_sz1024            -> fp
-  #   v01_w6a6_rp_n5000_sz1024 -> v01
+  IFS='|' read -r tag extra <<< "$entry"
   if [[ "$tag" =~ ^(fp|v[0-9]+) ]]; then
     task_id="${BASH_REMATCH[1]}"
   else
@@ -152,40 +214,38 @@ if [ ${#PENDING[@]} -eq 0 ]; then
   exit 0
 fi
 
-declare -A PID_GPU PID_TAG
-FREE_GPUS=("${GPUS[@]}")
+# Dispatcher: groups (not individual GPUs) are the schedulable unit.
+declare -A PID_GPU_GROUP PID_TAG
+FREE_GPU_GROUPS=("${GPU_GROUPS[@]}")
 overall_rc=0
 
-while [ ${#PENDING[@]} -gt 0 ] || [ ${#PID_GPU[@]} -gt 0 ]; do
-  # Fill all free GPUs from the pending queue.
-  while [ ${#FREE_GPUS[@]} -gt 0 ] && [ ${#PENDING[@]} -gt 0 ]; do
-    gpu="${FREE_GPUS[0]}"
-    FREE_GPUS=("${FREE_GPUS[@]:1}")
+while [ ${#PENDING[@]} -gt 0 ] || [ ${#PID_GPU_GROUP[@]} -gt 0 ]; do
+  while [ ${#FREE_GPU_GROUPS[@]} -gt 0 ] && [ ${#PENDING[@]} -gt 0 ]; do
+    group="${FREE_GPU_GROUPS[0]}"
+    FREE_GPU_GROUPS=("${FREE_GPU_GROUPS[@]:1}")
     entry="${PENDING[0]}"
     PENDING=("${PENDING[@]:1}")
-    IFS='|' read -r tag kind extra <<< "$entry"
-    run_task "$gpu" "$tag" "$kind" "$extra" &
+    IFS='|' read -r tag extra <<< "$entry"
+    run_task "$group" "$tag" "$extra" &
     pid=$!
-    PID_GPU[$pid]=$gpu
+    PID_GPU_GROUP[$pid]=$group
     PID_TAG[$pid]=$tag
-    echo "[pool] >>> launched $tag on GPU $gpu (pid $pid)" | tee -a "$STATUS"
+    echo "[pool] >>> launched $tag on GPUs $group (pid $pid)" | tee -a "$STATUS"
   done
 
-  # Block until any one child exits; -p captures its PID so we know which GPU to free.
   done_pid=0
   wait -n -p done_pid
   rc=$?
   if [ -z "${done_pid:-}" ] || [ "${done_pid}" = "0" ]; then
-    # Defensive: scan map for anything no longer alive.
-    for pid in "${!PID_GPU[@]}"; do
+    for pid in "${!PID_GPU_GROUP[@]}"; do
       if ! kill -0 "$pid" 2>/dev/null; then done_pid=$pid; break; fi
     done
   fi
-  gpu="${PID_GPU[$done_pid]:-}"
+  group="${PID_GPU_GROUP[$done_pid]:-}"
   tag="${PID_TAG[$done_pid]:-}"
-  if [ -n "$gpu" ]; then
-    unset 'PID_GPU[$done_pid]' 'PID_TAG[$done_pid]'
-    FREE_GPUS+=("$gpu")
+  if [ -n "$group" ]; then
+    unset 'PID_GPU_GROUP[$done_pid]' 'PID_TAG[$done_pid]'
+    FREE_GPU_GROUPS+=("$group")
     [ $rc -ne 0 ] && overall_rc=1
   fi
 done
